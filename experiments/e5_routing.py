@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import sys
 import time
 from collections import Counter
@@ -36,9 +37,71 @@ from harness import bootstrap, eval_model, load_repo_env, rule  # noqa: E402
 
 ROSTER_SIZES = [5, 200]
 MAX_CALLS = 40
+
+#: Cumulative USD cap across every E5 run, enforced via the ledger below so a
+#: sequence of runs cannot quietly overspend.
+DEFAULT_MAX_SPEND = 1.50
+SPEND_LEDGER = Path(__file__).parent / ".e5_spend.json"
 SEED = 20260916
-REQUEST_SPACING = 6.0  # free tier pacing
+REQUEST_SPACING = 1.0  # paid tier; free tier needed ~6s
 MAX_RETRIES = 6
+
+
+def read_ledger() -> Dict[str, Any]:
+    """Total spend, recomputed from the result files.
+
+    Accumulating into a side file loses any run that is killed before its
+    cleanup runs, which would silently under-report spend against the cap.
+    Every scored row carries its own cost, so summing them is authoritative.
+    """
+    total = 0.0
+    per_file: Dict[str, float] = {}
+    for path in sorted(SPEND_LEDGER.parent.glob("e5_results_*.jsonl")):
+        subtotal = 0.0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    subtotal += float(json.loads(line).get("cost_usd") or 0.0)
+                except Exception:
+                    continue
+        per_file[path.stem.replace("e5_results_", "")] = round(subtotal, 6)
+        total += subtotal
+    return {"total_usd": round(total, 6), "runs": per_file}
+
+
+def write_ledger(ledger: Dict[str, Any]) -> None:
+    SPEND_LEDGER.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
+
+
+def fetch_pricing(model: str) -> Dict[str, float]:
+    """Per-token prices, used to cost calls when OpenRouter reports none."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen("https://openrouter.ai/api/v1/models", timeout=30) as fh:
+            data = json.load(fh)["data"]
+    except Exception as exc:
+        print(f"  warning: could not fetch pricing ({exc}); relying on reported cost")
+        return {"prompt": 0.0, "completion": 0.0}
+    for entry in data:
+        if entry["id"] == model:
+            pricing = entry.get("pricing") or {}
+            return {
+                "prompt": float(pricing.get("prompt") or 0.0),
+                "completion": float(pricing.get("completion") or 0.0),
+            }
+    raise RuntimeError(f"model not found on OpenRouter: {model}")
+
+
+def call_cost(usage: Dict[str, Any], pricing: Dict[str, float]) -> float:
+    """Prefer OpenRouter's reported cost; fall back to tokens x list price."""
+    reported = usage.get("cost")
+    if isinstance(reported, (int, float)) and reported > 0:
+        return float(reported)
+    return (
+        usage.get("prompt_tokens", 0) * pricing["prompt"]
+        + usage.get("completion_tokens", 0) * pricing["completion"]
+    )
 
 
 def build_transcript(case: RoutingCase) -> str:
@@ -251,10 +314,14 @@ async def call_with_retry(request_fn, **kwargs) -> Dict[str, Any]:
         try:
             return await request_fn(**kwargs)
         except Exception as exc:  # OpenRouterError and transport errors alike
+            import httpx
+
             last = exc
             text = str(exc)
             lowered = text.lower()
-            retryable = any(
+            # httpx transport failures (ReadError, ConnectError, timeouts) often
+            # stringify to "", so classify them by type rather than by message.
+            retryable = isinstance(exc, (httpx.TransportError, httpx.HTTPError)) or any(
                 token in lowered
                 for token in ("429", "rate", "timeout", "503", "overload", "502", "temporarily")
             )
@@ -266,7 +333,13 @@ async def call_with_retry(request_fn, **kwargs) -> Dict[str, Any]:
     raise last  # pragma: no cover
 
 
-async def run_case(sandbox, case: RoutingCase, size: int, model: str) -> Dict[str, Any]:
+async def run_case(
+    sandbox,
+    case: RoutingCase,
+    size: int,
+    model: str,
+    pricing: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
     inter_agent = sandbox.modules["inter_agent"]
     inter_tools = sandbox.modules["inter_tools"]
     openrouter = sandbox.modules["openrouter_client"]
@@ -291,6 +364,9 @@ async def run_case(sandbox, case: RoutingCase, size: int, model: str) -> Dict[st
         system=system_prompt,
         tools=inter_tools.get_tool_schemas(),
     )
+
+    usage = response.get("usage") or {}
+    cost = call_cost(usage, pricing) if pricing else 0.0
 
     parsed = parse_routing_choice(response)
     chosen = parsed["chosen"]
@@ -317,6 +393,9 @@ async def run_case(sandbox, case: RoutingCase, size: int, model: str) -> Dict[st
         "prompt_bytes": len(content.encode("utf-8")),
         "detail": parsed["detail"],
         "note": case.note,
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", 0),
+        "cost_usd": round(cost, 6),
     }
 
 
@@ -352,24 +431,34 @@ def report(rows: List[Dict[str, Any]], label: str, ref: str, model: str) -> None
 
     small = {r["case_id"]: r for r in rows if r["roster_size"] == ROSTER_SIZES[0]}
     large = {r["case_id"]: r for r in rows if r["roster_size"] == ROSTER_SIZES[-1]}
-    flips = [
+    # A flip is a ROUTING regression, so both sides must have produced a
+    # routing decision. Counting a no_tool_call as a flip would blame the
+    # roster for what is really a tool-calling compliance failure.
+    SCORED = {"correct", "wrong_existing", "new_agent"}
+    paired = [
         cid
         for cid in small
         if cid in large
-        and small[cid]["outcome"] == "correct"
-        and large[cid]["outcome"] != "correct"
+        and small[cid]["outcome"] in SCORED
+        and large[cid]["outcome"] in SCORED
+    ]
+    flips = [
+        cid
+        for cid in paired
+        if small[cid]["outcome"] == "correct" and large[cid]["outcome"] != "correct"
     ]
     recovered = [
         cid
-        for cid in small
-        if cid in large
-        and small[cid]["outcome"] != "correct"
-        and large[cid]["outcome"] == "correct"
+        for cid in paired
+        if small[cid]["outcome"] != "correct" and large[cid]["outcome"] == "correct"
     ]
 
     print()
     print(rule("headline"))
-    print(f"  correct at {ROSTER_SIZES[0]} but wrong at {ROSTER_SIZES[-1]}: {len(flips)}/{len(small)}")
+    print(
+        f"  correct at {ROSTER_SIZES[0]} but wrong at {ROSTER_SIZES[-1]}: "
+        f"{len(flips)}/{len(paired)} cases routed at both sizes"
+    )
     if flips:
         for cid in flips:
             print(f"      {cid:<20} -> {large[cid]['chosen']!r}")
@@ -406,12 +495,19 @@ async def main() -> None:
         default=None,
         help="override OPENPOKE_EVAL_MODEL; both arms must use the same value",
     )
+    parser.add_argument(
+        "--max-spend",
+        type=float,
+        default=DEFAULT_MAX_SPEND,
+        help="cumulative USD cap across all E5 runs (ledger-backed)",
+    )
     args = parser.parse_args()
 
     load_repo_env()
     model = args.model or eval_model()
 
-    out_path = Path(args.out or Path(__file__).parent / f"e5_results_{args.label}.jsonl")
+    slug = re.sub(r"[^a-z0-9]+", "_", args.label.lower()).strip("_") or "run"
+    out_path = Path(args.out or Path(__file__).parent / f"e5_results_{slug}.jsonl")
     done = set()
     rows: List[Dict[str, Any]] = []
     if out_path.exists():
@@ -432,18 +528,46 @@ async def main() -> None:
     if len(work) > budget:
         raise RuntimeError(f"{len(work)} calls needed but budget is {budget}")
 
+    pricing = fetch_pricing(model)
+    ledger = read_ledger()
+    spent_before = float(ledger.get("total_usd", 0.0))
+    if spent_before >= args.max_spend:
+        raise RuntimeError(
+            f"spend cap reached: ${spent_before:.4f} of ${args.max_spend:.2f} already spent"
+        )
+
     sandbox = bootstrap(ref=args.ref)
+    run_cost = 0.0
     try:
         print(f"arm={args.label}  ref={sandbox.ref}  model={model}")
+        print(
+            f"pricing: ${pricing['prompt'] * 1e6:.3f}/M in, "
+            f"${pricing['completion'] * 1e6:.3f}/M out"
+        )
+        print(f"spent so far: ${spent_before:.4f} of ${args.max_spend:.2f} cap")
         print(f"{len(work)} calls to make (cap {MAX_CALLS})")
         print()
 
         consecutive_parse_failures = 0
+        call_failures = 0
         with out_path.open("a", encoding="utf-8") as handle:
             for i, (case, size) in enumerate(work, 1):
                 print(f"  [{i:>2}/{len(work)}] R={size:<4} {case.case_id}", end="", flush=True)
-                row = await run_case(sandbox, case, size, model)
-                print(f"  -> {row['outcome']}")
+                try:
+                    row = await run_case(sandbox, case, size, model, pricing)
+                except Exception as exc:
+                    # No row is written, so a later resume retries this case.
+                    # Nothing unscored ever lands in the results file.
+                    print(f"  -> CALL FAILED: {str(exc)[:70] or type(exc).__name__}")
+                    call_failures += 1
+                    if call_failures >= 5:
+                        print()
+                        print("  ABORT: 5 failed calls. Resume to retry the missing cases.")
+                        break
+                    continue
+                call_failures = 0
+                run_cost += row["cost_usd"]
+                print(f"  -> {row['outcome']:<14} ${row['cost_usd']:.5f}")
 
                 handle.write(json.dumps(row) + "\n")
                 handle.flush()
@@ -459,11 +583,25 @@ async def main() -> None:
                 else:
                     consecutive_parse_failures = 0
 
+                if spent_before + run_cost >= args.max_spend:
+                    print()
+                    print(
+                        f"  STOP: spend cap hit "
+                        f"(${spent_before + run_cost:.4f} >= ${args.max_spend:.2f})"
+                    )
+                    break
+
                 if i < len(work):
                     await asyncio.sleep(REQUEST_SPACING)
 
         report(rows, args.label, sandbox.ref, model)
     finally:
+        write_ledger(read_ledger())
+        print()
+        print(
+            f"  run cost ${run_cost:.4f}   |   cumulative "
+            f"${read_ledger()['total_usd']:.4f} of ${args.max_spend:.2f} cap"
+        )
         sandbox.cleanup()
 
 

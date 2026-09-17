@@ -45,3 +45,4 @@ server/venv/
 server/repomix-output.txt
 server/plans/
 experiments/e5_results_*.jsonl
+experiments/.e5_spend.json
