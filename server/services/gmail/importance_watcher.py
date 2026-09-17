@@ -123,7 +123,9 @@ class ImportantEmailWatcher:
         }
 
         try:
-            raw_result = execute_gmail_tool("GMAIL_FETCH_EMAILS", composio_user_id, arguments=arguments)
+            raw_result = await asyncio.to_thread(
+                execute_gmail_tool, "GMAIL_FETCH_EMAILS", composio_user_id, arguments=arguments
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to fetch Gmail messages for watcher",

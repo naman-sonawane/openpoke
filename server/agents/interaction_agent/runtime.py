@@ -1,11 +1,13 @@
 """Interaction Agent Runtime - handles LLM calls for user and agent turns."""
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from .agent import build_system_prompt, prepare_message_with_history
 from .tools import ToolResult, get_tool_schemas, handle_tool_call
+from ..execution_agent.batch_manager import reset_turn_id, set_turn_id
 from ...config import get_settings
 from ...services.conversation import get_conversation_log, get_working_memory_log
 from ...openrouter_client import request_chat_completion
@@ -65,6 +67,7 @@ class InteractionAgentRuntime:
     async def execute(self, user_message: str) -> InteractionResult:
         """Handle a user-authored message."""
 
+        token = set_turn_id(f"user-{uuid.uuid4()}")
         try:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_user_message(user_message)
@@ -95,11 +98,14 @@ class InteractionAgentRuntime:
                 response="",
                 error=str(exc),
             )
+        finally:
+            reset_turn_id(token)
 
     # Handle incoming messages from execution agents and generate appropriate responses
     async def handle_agent_message(self, agent_message: str) -> InteractionResult:
         """Process a status update emitted by an execution agent."""
 
+        token = set_turn_id(f"agent-{uuid.uuid4()}")
         try:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_agent_message(agent_message)
@@ -130,6 +136,8 @@ class InteractionAgentRuntime:
                 response="",
                 error=str(exc),
             )
+        finally:
+            reset_turn_id(token)
 
     # Core interaction loop that handles LLM calls and tool executions until completion
     async def _run_interaction_loop(

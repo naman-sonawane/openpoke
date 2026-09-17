@@ -1,5 +1,6 @@
 """Simplified Execution Agent Runtime."""
 
+import asyncio
 import inspect
 import json
 from typing import Dict, Any, List, Optional, Tuple
@@ -112,6 +113,7 @@ class ExecutionAgentRuntime:
                         self._safe_json_dump(tool_args),
                         record_payload
                     )
+                    self._harvest_identifiers(tool_args, result if success else None)
 
                     tool_message = {
                         "role": "tool",
@@ -147,6 +149,26 @@ class ExecutionAgentRuntime:
                 response=failure_text,
                 error=error_msg
             )
+
+    # Record email addresses and thread ids this agent touched, so the roster can
+    # find it later from an identifier alone rather than from name similarity
+    def _harvest_identifiers(self, tool_args: Dict[str, Any], result: Any) -> None:
+        # Import from the defining module, not the package re-export, so there
+        # is a single binding for the roster singleton.
+        from ...services.execution.roster import extract_identifiers, get_agent_roster
+
+        try:
+            blob = f"{self._safe_json_dump(tool_args)} {self._safe_json_dump(result)}"
+            found = extract_identifiers(blob)
+            if not found:
+                return
+            emails = sorted(value for value in found if "@" in value)
+            threads = sorted(value for value in found if "@" not in value)
+            get_agent_roster().touch(
+                self.agent.name, emails=emails, thread_ids=threads
+            )
+        except Exception as exc:  # pragma: no cover - never fail a tool call for this
+            logger.debug(f"[{self.agent.name}] identifier harvest skipped: {exc}")
 
     # Execute OpenRouter API call with system prompt, messages, and optional tool schemas
     async def _make_llm_call(self, system_prompt: str, messages: List[Dict], with_tools: bool) -> Dict:
@@ -228,9 +250,15 @@ class ExecutionAgentRuntime:
             return False, {"error": f"Unknown tool: {tool_name}"}
 
         try:
-            result = tool_func(**arguments)
-            if inspect.isawaitable(result):
-                result = await result
+            if inspect.iscoroutinefunction(tool_func):
+                result = await tool_func(**arguments)
+            else:
+                # Gmail and trigger tools are synchronous and do network or
+                # sqlite I/O. Calling them inline blocks the event loop, which
+                # serialises every other agent, the schedulers, and inbound HTTP.
+                result = await asyncio.to_thread(tool_func, **arguments)
+                if inspect.isawaitable(result):
+                    result = await result
             return True, result
         except Exception as e:
             return False, {"error": str(e)}

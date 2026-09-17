@@ -1,5 +1,6 @@
 """Interaction agent helpers for prompt construction."""
 
+import re
 from html import escape
 from pathlib import Path
 from typing import Dict, List
@@ -8,6 +9,13 @@ from ...services.execution import get_agent_roster
 
 _prompt_path = Path(__file__).parent / "system_prompt.md"
 SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8").strip()
+
+#: How many trailing conversation entries feed agent selection. A follow-up such
+#: as "did she reply?" shares no words with any agent name, so the selector has
+#: to see what came before it.
+RECENT_CONTEXT_ENTRIES = 6
+
+_ENTRY_RE = re.compile(r"<(\w+)(?:\s[^>]*)?>(.*?)</\1>", re.DOTALL)
 
 
 # Load and return the pre-defined system prompt from markdown file
@@ -26,7 +34,9 @@ def prepare_message_with_history(
     sections: List[str] = []
 
     sections.append(_render_conversation_history(transcript))
-    sections.append(f"<active_agents>\n{_render_active_agents()}\n</active_agents>")
+    sections.append(
+        f"<active_agents>\n{_render_active_agents(latest_text, transcript)}\n</active_agents>"
+    )
     sections.append(_render_current_turn(latest_text, message_type))
 
     content = "\n\n".join(sections)
@@ -41,19 +51,44 @@ def _render_conversation_history(transcript: str) -> str:
     return f"<conversation_history>\n{history}\n</conversation_history>"
 
 
-# Format currently active execution agents into XML tags for LLM awareness
-def _render_active_agents() -> str:
+# Extract the payloads of the last few conversation entries for agent selection
+def _recent_context(transcript: str, latest_text: str) -> str:
+    payloads = [match.group(2).strip() for match in _ENTRY_RE.finditer(transcript or "")]
+    recent = payloads[-RECENT_CONTEXT_ENTRIES:]
+    return "\n".join([*recent, latest_text or ""])
+
+
+# Format the execution agents relevant to this turn into XML tags for LLM awareness
+def _render_active_agents(latest_text: str = "", transcript: str = "") -> str:
     roster = get_agent_roster()
     roster.load()
-    agents = roster.get_agents()
+    roster.archive_stale()
 
-    if not agents:
+    context = _recent_context(transcript, latest_text)
+    records = roster.get_agents_for_prompt(context)
+
+    if not records:
         return "None"
 
     rendered: List[str] = []
-    for agent_name in agents:
-        name = escape(agent_name or "agent", quote=True)
-        rendered.append(f'<agent name="{name}" />')
+    for record in records:
+        name = escape(record.name or "agent", quote=True)
+        parts = [f'name="{name}"']
+        if record.description:
+            parts.append(f'purpose="{escape(record.description, quote=True)}"')
+        if record.emails:
+            parts.append(f'contacts="{escape(", ".join(record.emails[:3]), quote=True)}"')
+        if record.archived:
+            parts.append('archived="true"')
+        rendered.append(f'<agent {" ".join(parts)} />')
+
+    counts = roster.counts()
+    hidden = counts["total"] - len(records)
+    if hidden > 0:
+        rendered.append(
+            f"<!-- {hidden} further agents are not shown. If none of the agents "
+            f"above fits, reuse one by its exact name or create a new one. -->"
+        )
 
     return "\n".join(rendered)
 

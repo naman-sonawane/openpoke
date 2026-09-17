@@ -35,6 +35,10 @@ TOOL_SCHEMAS = [
                         "description": "Human-readable agent name describing its purpose (e.g., 'Vercel Job Offer', 'Email to Sharanjeet'). This name will be used to identify and potentially reuse the agent."
                     },
                     "instructions": {"type": "string", "description": "Instructions for the agent to execute."},
+                    "description": {
+                        "type": "string",
+                        "description": "One short line describing what this agent is for, e.g. 'Chasing Sharanjeet for the lease renewal paperwork'. Only needed when creating a new agent; it is what makes the agent findable later.",
+                    },
                 },
                 "required": ["agent_name", "instructions"],
                 "additionalProperties": False,
@@ -109,15 +113,18 @@ _EXECUTION_BATCH_MANAGER = ExecutionBatchManager()
 
 
 # Create or reuse execution agent and dispatch instructions asynchronously
-def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
+def send_message_to_agent(
+    agent_name: str, instructions: str, description: str = ""
+) -> ToolResult:
     """Send instructions to an execution agent."""
     roster = get_agent_roster()
     roster.load()
-    existing_agents = set(roster.get_agents())
+    existing_agents = {record.name for record in roster.get_records()}
     is_new = agent_name not in existing_agents
 
-    if is_new:
-        roster.add_agent(agent_name)
+    # add_agent also reactivates an archived agent and fills in a missing
+    # description, so it is the right call for both new and existing names.
+    roster.add_agent(agent_name, description=description or "")
 
     get_execution_agent_logs().record_request(agent_name, instructions)
 
