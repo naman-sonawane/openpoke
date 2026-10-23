@@ -1,15 +1,24 @@
 'use client';
 
+import clsx from 'clsx';
 import { useCallback, useEffect, useState } from 'react';
-import SettingsModal, { useSettings } from '@/components/SettingsModal';
-import { ChatHeader } from '@/components/chat/ChatHeader';
+import { useSettings } from '@/components/SettingsModal';
 import { ChatInput } from '@/components/chat/ChatInput';
 import { ChatMessages } from '@/components/chat/ChatMessages';
 import { ErrorBanner } from '@/components/chat/ErrorBanner';
 import { useAutoScroll } from '@/components/chat/useAutoScroll';
 import type { ChatBubble } from '@/components/chat/types';
+import { StaffPanel, type IntakeState } from '@/components/intake/StaffPanel';
+import { useVoiceCall, type VoiceStatus } from '@/components/voice/useVoiceCall';
 
 const POLL_INTERVAL_MS = 1500;
+
+const STATUS_LABEL: Record<VoiceStatus, string> = {
+  off: 'Voice off',
+  listening: 'Listening…',
+  thinking: 'Thinking…',
+  speaking: 'Speaking…',
+};
 
 const formatEscapeCharacters = (text: string): string => {
   return text
@@ -38,17 +47,16 @@ const toBubbles = (payload: any): ChatBubble[] => {
 
 export default function Page() {
   const { settings, setSettings } = useSettings();
-  const [open, setOpen] = useState(false);
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<ChatBubble[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isWaitingForResponse, setIsWaitingForResponse] = useState(false);
+  const [intakeState, setIntakeState] = useState<IntakeState | null>(null);
+  const [lastLatencyMs, setLastLatencyMs] = useState<number | null>(null);
   const { scrollContainerRef, handleScroll } = useAutoScroll({
     items: messages,
     isWaiting: isWaitingForResponse,
   });
-  const openSettings = useCallback(() => setOpen(true), [setOpen]);
-  const closeSettings = useCallback(() => setOpen(false), [setOpen]);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -62,198 +70,174 @@ export default function Page() {
     }
   }, []);
 
+  const loadIntakeState = useCallback(async () => {
+    try {
+      const res = await fetch('/api/intake/state', { cache: 'no-store' });
+      if (res.ok) setIntakeState(await res.json());
+    } catch (err) {
+      console.debug('Failed to load intake state', err);
+    }
+  }, []);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([loadHistory(), loadIntakeState()]);
+  }, [loadHistory, loadIntakeState]);
+
   useEffect(() => {
-    void loadHistory();
-  }, [loadHistory]);
+    void refresh();
+    const intervalId = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
+    return () => window.clearInterval(intervalId);
+  }, [refresh]);
 
   // Detect and store browser timezone on first load
   useEffect(() => {
-    const detectAndStoreTimezone = async () => {
-      // Only run if timezone not already stored
-      if (settings.timezone) return;
-      
-      try {
-        const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-        
-        // Send to server
-        const response = await fetch('/api/timezone', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ timezone: browserTimezone }),
-        });
-        
-        if (response.ok) {
-          // Update local settings
-          setSettings({ ...settings, timezone: browserTimezone });
-        }
-      } catch (error) {
-        // Fail silently - timezone detection is not critical
-        console.debug('Timezone detection failed:', error);
-      }
-    };
-
-    void detectAndStoreTimezone();
+    if (settings.timezone) return;
+    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    fetch('/api/timezone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ timezone: browserTimezone }),
+    })
+      .then((response) => {
+        if (response.ok) setSettings({ ...settings, timezone: browserTimezone });
+      })
+      .catch((err) => console.debug('Timezone detection failed:', err));
   }, [settings, setSettings]);
 
-
-  useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      void loadHistory();
-    }, POLL_INTERVAL_MS);
-
-    return () => window.clearInterval(intervalId);
-  }, [loadHistory]);
-
-  const canSubmit = input.trim().length > 0;
-  const inputPlaceholder = 'Type a message…';
-
-  const sendMessage = useCallback(
-    async (text: string) => {
+  // One caller turn, typed or spoken. Waits for the reply instead of polling.
+  const sendTurn = useCallback(
+    async (text: string): Promise<string | null> => {
       const trimmed = text.trim();
-      if (!trimmed) return;
+      if (!trimmed) return null;
 
       setError(null);
       setIsWaitingForResponse(true);
-
-      // Optimistically add the user message immediately
-      const userMessage: ChatBubble = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        text: formatEscapeCharacters(trimmed),
-      };
-      setMessages(prev => {
-        const newMessages = [...prev, userMessage];
-        return newMessages;
-      });
+      setMessages((prev) => [...prev, { id: `user-${Date.now()}`, role: 'user', text: trimmed }]);
 
       try {
-        const res = await fetch('/api/chat', {
+        const res = await fetch('/api/voice/turn', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: [{ role: 'user', content: trimmed }],
-          }),
+          body: JSON.stringify({ text: trimmed }),
         });
-
-        if (!(res.ok || res.status === 202)) {
-          const detail = await res.text();
-          throw new Error(detail || `Request failed (${res.status})`);
-        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
+        setLastLatencyMs(data.latency_ms ?? null);
+        return data.reply || null;
       } catch (err: any) {
-        console.error('Failed to send message', err);
+        console.error('Failed to send turn', err);
         setError(err?.message || 'Failed to send message');
-        // Remove the optimistic message on error
-        setMessages(prev => prev.filter(msg => msg.id !== userMessage.id));
-        setIsWaitingForResponse(false);
-        throw err instanceof Error ? err : new Error('Failed to send message');
+        return null;
       } finally {
-        // Poll until we get the assistant's response
-        let pollAttempts = 0;
-        const maxPollAttempts = 30; // Max 30 attempts (30 seconds)
-        
-        const pollForAssistantResponse = async () => {
-          pollAttempts++;
-          
-          try {
-            const res = await fetch('/api/chat/history', { cache: 'no-store' });
-            if (res.ok) {
-              const data = await res.json();
-              const currentMessages = toBubbles(data);
-              
-              // Check if the last message is from assistant and contains our user message
-              const lastMessage = currentMessages[currentMessages.length - 1];
-              const hasUserMessage = currentMessages.some(msg => msg.text === trimmed && msg.role === 'user');
-              const hasAssistantResponse = lastMessage?.role === 'assistant' && hasUserMessage;
-              
-              if (hasAssistantResponse) {
-                // We got the assistant response, update messages and stop loading
-                setMessages(currentMessages);
-                setIsWaitingForResponse(false);
-                return;
-              }
-            }
-          } catch (err) {
-            console.error('Error polling for response:', err);
-          }
-          
-          // Continue polling if we haven't exceeded max attempts
-          if (pollAttempts < maxPollAttempts) {
-            setTimeout(pollForAssistantResponse, 1000); // Poll every second
-          } else {
-            // Timeout - stop loading and update messages anyway
-            setIsWaitingForResponse(false);
-            await loadHistory();
-          }
-        };
-        
-        // Start polling after a brief delay
-        setTimeout(pollForAssistantResponse, 1000);
+        setIsWaitingForResponse(false);
+        void refresh();
       }
     },
-    [loadHistory],
+    [refresh],
   );
 
-  const handleClearHistory = useCallback(async () => {
-    try {
-      const res = await fetch('/api/chat/history', { method: 'DELETE' });
-      if (!res.ok) {
-        console.error('Failed to clear chat history', res.statusText);
-        return;
-      }
-      setMessages([]);
-    } catch (err) {
-      console.error('Failed to clear chat history', err);
-    }
-  }, [setMessages]);
+  const voice = useVoiceCall({ onTurn: sendTurn });
 
-  const triggerClearHistory = useCallback(() => {
-    void handleClearHistory();
-  }, [handleClearHistory]);
+  const startNewCall = useCallback(async () => {
+    window.speechSynthesis?.cancel();
+    setError(null);
+    setLastLatencyMs(null);
+    try {
+      await fetch('/api/chat/history', { method: 'DELETE' });
+      const res = await fetch('/api/voice/start', { method: 'POST' });
+      const data = await res.json();
+      await refresh();
+      if (voice.active && data?.reply) void voice.speak(data.reply);
+    } catch (err: any) {
+      setError(err?.message || 'Failed to start a new call');
+    }
+  }, [refresh, voice]);
+
+  const toggleDemo = useCallback(
+    async (key: 'fail_next_tool' | 'slot_conflict', value: boolean) => {
+      await fetch('/api/intake/demo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [key]: value }),
+      });
+      void loadIntakeState();
+    },
+    [loadIntakeState],
+  );
 
   const handleSubmit = useCallback(async () => {
-    if (!canSubmit) return;
     const value = input;
+    if (!value.trim()) return;
     setInput('');
-    try {
-      await sendMessage(value);
-    } catch {
-      setInput(value);
-    }
-  }, [canSubmit, input, sendMessage, setInput]);
-
-  const handleInputChange = useCallback((value: string) => {
-    setInput(value);
-  }, [setInput]);
-
-  const clearError = useCallback(() => setError(null), [setError]);
+    const reply = await sendTurn(value);
+    if (reply && voice.active) void voice.speak(reply);
+  }, [input, sendTurn, voice]);
 
   return (
     <main className="chat-bg min-h-screen p-4 sm:p-6">
-      <div className="chat-wrap flex flex-col">
-        <ChatHeader onOpenSettings={openSettings} onClearHistory={triggerClearHistory} />
-
-        <div className="card flex-1 overflow-hidden">
-          <ChatMessages
-            messages={messages}
-            isWaitingForResponse={isWaitingForResponse}
-            scrollContainerRef={scrollContainerRef}
-            onScroll={handleScroll}
-          />
-
-          <div className="border-t border-gray-200 p-3">
-            {error && <ErrorBanner message={error} onDismiss={clearError} />}
-
-            <ChatInput
-              value={input}
-              canSubmit={canSubmit}
-              placeholder={inputPlaceholder}
-              onChange={handleInputChange}
-              onSubmit={handleSubmit}
-            />
+      <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
+        <header className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h1 className="text-lg font-semibold">Maple Street Family Medicine</h1>
+            <p className="text-sm text-gray-500">Voice intake and scheduling</p>
           </div>
-        </div>
+          <div className="flex items-center gap-2">
+            {voice.supported ? (
+              <button
+                className={clsx(
+                  'rounded-md border px-3 py-2 text-sm',
+                  voice.active ? 'border-red-200 bg-red-50 text-red-700' : 'border-gray-200 hover:bg-gray-50',
+                )}
+                onClick={voice.active ? voice.stop : voice.start}
+              >
+                {voice.active ? 'Stop voice' : 'Start voice'}
+              </button>
+            ) : (
+              <span className="text-xs text-gray-500">Voice needs Chrome or Edge</span>
+            )}
+            <button className="btn" onClick={() => void startNewCall()}>
+              New call
+            </button>
+          </div>
+        </header>
 
-        <SettingsModal open={open} onClose={closeSettings} settings={settings} onSave={setSettings} />
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
+          <div className="card flex flex-col overflow-hidden">
+            <div className="flex items-center gap-2 border-b border-gray-100 px-4 py-2 text-sm text-gray-600">
+              <span
+                className={clsx(
+                  'h-2.5 w-2.5 rounded-full',
+                  voice.status === 'listening' && 'animate-pulse bg-green-500',
+                  voice.status === 'thinking' && 'bg-amber-400',
+                  voice.status === 'speaking' && 'bg-blue-500',
+                  voice.status === 'off' && 'bg-gray-300',
+                )}
+              />
+              {STATUS_LABEL[voice.status]}
+              {voice.interim && <span className="truncate italic text-gray-400">“{voice.interim}”</span>}
+            </div>
+
+            <ChatMessages
+              messages={messages}
+              isWaitingForResponse={isWaitingForResponse}
+              scrollContainerRef={scrollContainerRef}
+              onScroll={handleScroll}
+            />
+
+            <div className="border-t border-gray-200 p-3">
+              {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+              <ChatInput
+                value={input}
+                canSubmit={input.trim().length > 0 && !isWaitingForResponse}
+                placeholder={voice.active ? 'Speak, or type as the caller…' : 'Type as the caller…'}
+                onChange={setInput}
+                onSubmit={handleSubmit}
+              />
+            </div>
+          </div>
+
+          <StaffPanel state={intakeState} lastLatencyMs={lastLatencyMs} onToggleDemo={toggleDemo} />
+        </div>
       </div>
     </main>
   );

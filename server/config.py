@@ -50,9 +50,14 @@ class Settings(BaseModel):
     server_host: str = Field(default=os.getenv("OPENPOKE_HOST", "0.0.0.0"))
     server_port: int = Field(default=_env_int("OPENPOKE_PORT", 8001))
 
-    # LLM model selection
-    interaction_agent_model: str = Field(default="anthropic/claude-sonnet-4")
-    execution_agent_model: str = Field(default="anthropic/claude-sonnet-4")
+    # "intake" runs the doctor's-office receptionist; "assistant" is the original
+    # email assistant.
+    mode: str = Field(default=os.getenv("OPENPOKE_MODE", "intake"))
+
+    # LLM model selection. Haiku on the conversational path: on a voice call the
+    # time to the first spoken word matters more than the last point of quality.
+    interaction_agent_model: str = Field(default="anthropic/claude-haiku-4.5")
+    execution_agent_model: str = Field(default="anthropic/claude-haiku-4.5")
     execution_agent_search_model: str = Field(default="anthropic/claude-sonnet-4")
     summarizer_model: str = Field(default="anthropic/claude-sonnet-4")
     email_classifier_model: str = Field(default="anthropic/claude-sonnet-4")
@@ -82,6 +87,10 @@ class Settings(BaseModel):
     def resolved_docs_url(self) -> Optional[str]:
         """Return documentation URL when docs are enabled."""
         return (self.docs_url or "/docs") if self.enable_docs else None
+
+    @property
+    def intake_mode(self) -> bool:
+        return self.mode.strip().lower() == "intake"
 
     @property
     def summarization_enabled(self) -> bool:

@@ -10,6 +10,7 @@ from .tools import ToolResult, get_tool_schemas, handle_tool_call
 from ..execution_agent.batch_manager import reset_turn_id, set_turn_id
 from ...config import get_settings
 from ...services.conversation import get_conversation_log, get_working_memory_log
+from ...services.intake import handoff_on_error, pre_screen
 from ...openrouter_client import request_chat_completion
 from ...logging_config import logger
 
@@ -72,15 +73,27 @@ class InteractionAgentRuntime:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_user_message(user_message)
 
+            # The safety screen runs before the model on every caller turn. When
+            # it answers (911 script, confirm question) the model is skipped.
+            safety_note = None
+            if self.settings.intake_mode:
+                decision = pre_screen(user_message)
+                if decision.reply:
+                    self.conversation_log.record_reply(decision.reply)
+                    return InteractionResult(success=True, response=decision.reply)
+                safety_note = decision.note
+
             system_prompt = build_system_prompt()
             messages = prepare_message_with_history(
-                user_message, transcript_before, message_type="user"
+                user_message, transcript_before, message_type="user", safety_note=safety_note
             )
 
             logger.info("Processing user message through interaction agent")
             summary = await self._run_interaction_loop(system_prompt, messages)
 
             final_response = self._finalize_response(summary)
+            if not final_response and self.settings.intake_mode:
+                final_response = "Sorry, could you say that again?"
 
             if final_response and not summary.user_messages:
                 self.conversation_log.record_reply(final_response)
@@ -93,6 +106,11 @@ class InteractionAgentRuntime:
 
         except Exception as exc:
             logger.error("Interaction agent failed", extra={"error": str(exc)})
+            if self.settings.intake_mode:
+                # Never leave a caller in silence: hand off and say so.
+                reply = handoff_on_error(str(exc))
+                self.conversation_log.record_reply(reply)
+                return InteractionResult(success=False, response=reply, error=str(exc))
             return InteractionResult(
                 success=False,
                 response="",
@@ -214,16 +232,24 @@ class InteractionAgentRuntime:
     ) -> Dict[str, Any]:
         """Make an LLM call via OpenRouter."""
 
+        # Re-read every call: in intake mode the allowed tools change with the
+        # call stage, which can move mid-turn (e.g. after lookup_patient).
+        used = [
+            (call.get("function") or {}).get("name")
+            for message in messages
+            for call in (message.get("tool_calls") or [])
+        ]
+        tool_schemas = get_tool_schemas(already_used=[name for name in used if name])
         logger.debug(
             "Interaction agent calling LLM",
-            extra={"model": self.model, "tools": len(self.tool_schemas)},
+            extra={"model": self.model, "tools": len(tool_schemas)},
         )
         return await request_chat_completion(
             model=self.model,
             messages=messages,
             system=system_prompt,
             api_key=self.api_key,
-            tools=self.tool_schemas,
+            tools=tool_schemas,
         )
 
     # Extract the assistant's message from the OpenRouter API response structure
@@ -395,7 +421,9 @@ class InteractionAgentRuntime:
         if detail:
             log_payload.update(detail)
 
-        if stage == "done":
+        if stage == "done" and result is not None and not result.success:
+            logger.info(f"Tool '{tool_call.name}' returned error: {str(result.payload)[:200]}")
+        elif stage == "done":
             logger.info(f"Tool '{tool_call.name}' completed")
         elif stage in {"error", "rejected"}:
             logger.warning(f"Tool '{tool_call.name}' {stage}")

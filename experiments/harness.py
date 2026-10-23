@@ -162,6 +162,8 @@ def bootstrap(ref: Optional[str] = None) -> Sandbox:
     resolved_ref = _materialize_server(tmp_root, ref)
 
     os.environ.setdefault("OPENROUTER_API_KEY", "fake-key-for-experiments")
+    # The scaling experiments exercise the email assistant, not the intake flow.
+    os.environ.setdefault("OPENPOKE_MODE", "assistant")
     sys.path.insert(0, str(tmp_root))
 
     for name in list(sys.modules):

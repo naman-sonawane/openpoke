@@ -1,14 +1,18 @@
 """Interaction agent helpers for prompt construction."""
 
+import json
 import re
 from html import escape
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+from ...config import get_settings
 from ...services.execution import get_agent_roster
+from ...services.intake import get_call_state
 
 _prompt_path = Path(__file__).parent / "system_prompt.md"
 SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8").strip()
+INTAKE_PROMPT = (Path(__file__).parent / "intake_prompt.md").read_text(encoding="utf-8").strip()
 
 #: How many trailing conversation entries feed agent selection. A follow-up such
 #: as "did she reply?" shares no words with any agent name, so the selector has
@@ -21,7 +25,7 @@ _ENTRY_RE = re.compile(r"<(\w+)(?:\s[^>]*)?>(.*?)</\1>", re.DOTALL)
 # Load and return the pre-defined system prompt from markdown file
 def build_system_prompt() -> str:
     """Return the static system prompt for the interaction agent."""
-    return SYSTEM_PROMPT
+    return INTAKE_PROMPT if get_settings().intake_mode else SYSTEM_PROMPT
 
 
 # Build structured message with conversation history, active agents, and current turn
@@ -29,14 +33,23 @@ def prepare_message_with_history(
     latest_text: str,
     transcript: str,
     message_type: str = "user",
+    safety_note: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """Compose a message that bundles history, roster, and the latest turn."""
     sections: List[str] = []
 
     sections.append(_render_conversation_history(transcript))
-    sections.append(
-        f"<active_agents>\n{_render_active_agents(latest_text, transcript)}\n</active_agents>"
-    )
+    if get_settings().intake_mode:
+        # The receptionist has no use for the email agents; it sees the call's
+        # structured state instead.
+        state = json.dumps(get_call_state().prompt_view(), indent=1, default=str)
+        sections.append(f"<call_state>\n{state}\n</call_state>")
+    else:
+        sections.append(
+            f"<active_agents>\n{_render_active_agents(latest_text, transcript)}\n</active_agents>"
+        )
+    if safety_note:
+        sections.append(f"<safety_note>\n{safety_note}\n</safety_note>")
     sections.append(_render_current_turn(latest_text, message_type))
 
     content = "\n\n".join(sections)

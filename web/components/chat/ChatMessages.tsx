@@ -60,9 +60,9 @@ function TypingIndicator() {
 function EmptyState() {
   return (
     <div className="mx-auto my-12 max-w-sm text-center text-gray-500">
-      <h2 className="mb-2 text-xl font-semibold text-gray-700">Start a conversation</h2>
+      <h2 className="mb-2 text-xl font-semibold text-gray-700">No call in progress</h2>
       <p className="text-sm">
-        Your messages will appear here. Send something to get started.
+        Press New call to hear the greeting, then speak or type as the caller.
       </p>
     </div>
   );

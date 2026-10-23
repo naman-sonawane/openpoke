@@ -5,10 +5,13 @@ import json
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from ...config import get_settings
 from ...logging_config import logger
 from ...services.conversation import get_conversation_log
 from ...services.execution import get_agent_roster, get_execution_agent_logs
+from ...services.intake import run_tool as run_intake_tool
 from ..execution_agent.batch_manager import ExecutionBatchManager
+from .intake_tools import INTAKE_TOOL_SCHEMAS, get_intake_tool_schemas
 
 
 @dataclass
@@ -216,8 +219,15 @@ def wait(reason: str) -> ToolResult:
 
 
 # Return predefined tool schemas for LLM function calling
-def get_tool_schemas():
-    """Return OpenAI-compatible tool schemas."""
+def get_tool_schemas(already_used=()):
+    """Return OpenAI-compatible tool schemas.
+
+    In intake mode this depends on the call stage, so call it per LLM request.
+    The receptionist replies with plain text, which saves a tool round trip
+    per turn compared to send_message_to_user.
+    """
+    if get_settings().intake_mode:
+        return get_intake_tool_schemas(already_used)
     return TOOL_SCHEMAS
 
 
@@ -231,6 +241,10 @@ def handle_tool_call(name: str, arguments: Any) -> ToolResult:
             args = arguments
         else:
             return ToolResult(success=False, payload={"error": "Invalid arguments format"})
+
+        if get_settings().intake_mode and name in INTAKE_TOOL_SCHEMAS:
+            success, payload = run_intake_tool(name, args)
+            return ToolResult(success=success, payload=payload)
 
         if name == "send_message_to_agent":
             return send_message_to_agent(**args)

@@ -42,6 +42,11 @@ def clear_history() -> ChatHistoryClearResponse:
     trigger_service = get_trigger_service()
     trigger_service.clear_all()
 
+    # Start a fresh intake call (demo scenarios reset through here)
+    from ..services.intake import reset_call_state
+
+    reset_call_state()
+
     return ChatHistoryClearResponse()
 
 

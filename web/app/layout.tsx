@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'OpenPoke Chat',
-  description: 'A beautiful OpenRouter chat powered by Vercel AI SDK',
+  title: 'Intake Console',
+  description: 'Voice intake and scheduling agent for a medical office, built on OpenPoke',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
