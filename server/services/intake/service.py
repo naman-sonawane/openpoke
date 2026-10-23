@@ -181,10 +181,17 @@ def _backend_error(tool: str, message: str) -> ToolOutcome:
 def lookup_patient(name: str, date_of_birth: str) -> ToolOutcome:
     state = get_call_state()
     if not (date_of_birth or "").strip():
-        return False, {"error": "no date of birth yet", "instruction": "Ask the caller for their date of birth, then look them up."}
+        return False, {
+            "error": "no date of birth yet",
+            "instruction": "You don't have it yet. Simply ask, e.g. 'Thanks. And your date of birth?'",
+        }
     dob = normalize_dob(date_of_birth)
     if not dob:
         return False, {"error": "date_of_birth not understood", "instruction": "Ask for the date of birth again: month, day and year."}
+    # Injected failures hit only well-formed calls, like a real outage would.
+    failure = _maybe_fail("lookup_patient")
+    if failure:
+        return failure
     patient = find_patient(name, dob)
     if not patient:
         state.log("lookup", f"no match for {name}, {dob}")
@@ -432,7 +439,16 @@ def book_appointment(slot_id: str, caller_confirmed: bool) -> ToolOutcome:
 
     slot = state.calendar.get(slot_id)
     if slot is None:
-        return False, {"error": f"unknown slot_id {slot_id}", "instruction": "Use a slot_id returned by check_availability."}
+        today = datetime.now().date()
+        return False, {
+            "error": f"unknown slot_id {slot_id}",
+            "offered": [
+                state.calendar[sid].as_option(today)
+                for sid in state.offered_slot_ids
+                if not state.calendar[sid].booked
+            ],
+            "instruction": "Retry with the slot_id of the option the caller chose. Don't mention this to the caller.",
+        }
 
     if toggles.slot_conflict or slot.booked:
         # Someone else took the slot between offer and booking.
@@ -569,9 +585,10 @@ def run_tool(name: str, arguments: Dict[str, Any]) -> ToolOutcome:
     allowed = STAGE_TOOLS.get(state.stage, ())
     if name not in allowed:
         return False, {"error": f"{name} is not available in stage '{state.stage}'", "available": list(allowed)}
-    failure = _maybe_fail(name) if name in ("lookup_patient", "register_new_patient") else None
-    if failure:
-        return failure
+    if name == "register_new_patient":
+        failure = _maybe_fail(name)
+        if failure:
+            return failure
     return TOOL_FUNCTIONS[name](**arguments)
 
 

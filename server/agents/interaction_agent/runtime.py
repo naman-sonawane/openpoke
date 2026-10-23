@@ -23,6 +23,7 @@ class InteractionResult:
     response: str
     error: Optional[str] = None
     execution_agents_used: int = 0
+    llm_calls: int = 0
 
 
 @dataclass
@@ -42,6 +43,7 @@ class _LoopSummary:
     user_messages: List[str] = field(default_factory=list)
     tool_names: List[str] = field(default_factory=list)
     execution_agents: Set[str] = field(default_factory=set)
+    llm_calls: int = 0
 
 
 class InteractionAgentRuntime:
@@ -102,6 +104,7 @@ class InteractionAgentRuntime:
                 success=True,
                 response=final_response,
                 execution_agents_used=len(summary.execution_agents),
+                llm_calls=summary.llm_calls,
             )
 
         except Exception as exc:
@@ -169,6 +172,7 @@ class InteractionAgentRuntime:
 
         for iteration in range(self.MAX_TOOL_ITERATIONS):
             response = await self._make_llm_call(system_prompt, messages)
+            summary.llm_calls += 1
             assistant_message = self._extract_assistant_message(response)
 
             assistant_content = (assistant_message.get("content") or "").strip()
@@ -244,12 +248,25 @@ class InteractionAgentRuntime:
             "Interaction agent calling LLM",
             extra={"model": self.model, "tools": len(tool_schemas)},
         )
+        if not self.settings.intake_mode:
+            return await request_chat_completion(
+                model=self.model,
+                messages=messages,
+                system=system_prompt,
+                api_key=self.api_key,
+                tools=tool_schemas,
+            )
+        # On a call every model round trip is dead air: route to the fastest
+        # provider (measured ~1.05s -> ~0.75s p50 per call) and cap the reply,
+        # which is one or two spoken sentences anyway.
         return await request_chat_completion(
             model=self.model,
             messages=messages,
             system=system_prompt,
             api_key=self.api_key,
             tools=tool_schemas,
+            provider={"sort": "latency"},
+            max_tokens=400,
         )
 
     # Extract the assistant's message from the OpenRouter API response structure

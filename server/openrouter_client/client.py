@@ -54,6 +54,8 @@ async def request_chat_completion(
     api_key: Optional[str] = None,
     tools: Optional[List[Dict[str, Any]]] = None,
     base_url: str = OpenRouterBaseURL,
+    provider: Optional[Dict[str, Any]] = None,
+    max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Request a chat completion and return the raw JSON payload."""
 
@@ -64,8 +66,12 @@ async def request_chat_completion(
     }
     if tools:
         payload["tools"] = tools
+    if provider:
+        payload["provider"] = provider
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
 
-    url = f"{base_url.rstrip('/')}/chat/completions"
+    url =f"{base_url.rstrip('/')}/chat/completions"
 
     async with httpx.AsyncClient() as client:
         try:

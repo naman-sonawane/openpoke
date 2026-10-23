@@ -67,6 +67,7 @@ async def voice_turn(payload: VoiceTurnRequest) -> JSONResponse:
     async with _turn_lock:
         result = await runtime.execute(user_message=text)
     body = _turn_payload(result.response, started)
+    body["llm_calls"] = result.llm_calls
     logger.info("voice turn", extra={"latency_ms": body["latency_ms"], "stage": body["stage"]})
     if not result.success:
         body["error"] = result.error

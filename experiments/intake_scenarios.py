@@ -117,8 +117,9 @@ SCENARIOS = [
     ),
     Scenario(
         "negated_red_flag",
-        "You are Priya Patel, born November 2 1978. You have a cough for about five days. Early on, say "
-        "'no chest pain or anything, just the cough'. If asked whether you have chest pain, say no. Pain "
+        "You are Priya Patel, born November 2 1978. You have a cough for about five days. When asked why "
+        "you're calling, you must say these exact words: 'I've had a cough for five days, no chest pain or "
+        "anything, just the cough.' If asked whether you have chest pain, say no. Pain "
         "1 out of 10, not getting worse. Afternoons are best; the number on file is fine.",
         [expect_event("safety_check"), expect_stage("booked")],
     ),
@@ -186,6 +187,7 @@ async def run_scenario(client: httpx.AsyncClient, scenario: Scenario) -> Dict[st
     start = (await client.post(f"{BASE}/voice/start")).json()
     transcript = [{"role": "agent", "text": start["reply"]}]
     latencies: List[int] = []
+    llm_calls: List[int] = []
 
     for _ in range(MAX_TURNS):
         said = await caller_reply(client, scenario.persona, transcript)
@@ -194,11 +196,19 @@ async def run_scenario(client: httpx.AsyncClient, scenario: Scenario) -> Dict[st
         transcript.append({"role": "caller", "text": said})
         turn = (await client.post(f"{BASE}/voice/turn", json={"text": said}, timeout=120)).json()
         latencies.append(turn["latency_ms"])
+        llm_calls.append(turn.get("llm_calls", 0))
         transcript.append({"role": "agent", "text": turn["reply"]})
 
     state = (await client.get(f"{BASE}/intake/state")).json()
     failures = [msg for check in scenario.checks + COMMON if (msg := check(state, transcript))]
-    return {"scenario": scenario, "transcript": transcript, "state": state, "failures": failures, "latencies": latencies}
+    return {
+        "scenario": scenario,
+        "transcript": transcript,
+        "state": state,
+        "failures": failures,
+        "latencies": latencies,
+        "llm_calls": llm_calls,
+    }
 
 
 async def main(selected: List[str]) -> int:
@@ -229,7 +239,10 @@ async def main(selected: List[str]) -> int:
     if all_latencies:
         ordered = sorted(all_latencies)
         p90 = ordered[int(0.9 * (len(ordered) - 1))]
+        calls = [c for r in results for c in r["llm_calls"]]
+        no_model = sum(1 for c in calls if c == 0)
         print(f"\nall turns: n={len(ordered)} p50={int(statistics.median(ordered))}ms p90={p90}ms")
+        print(f"model calls per turn: mean={statistics.mean(calls):.2f}, turns answered by the safety gate alone={no_model}")
     passed = sum(not r["failures"] for r in results)
     print(f"{passed}/{len(results)} scenarios passed")
     return 0 if passed == len(results) else 1
