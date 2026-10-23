@@ -4,9 +4,24 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 export type VoiceStatus = 'off' | 'listening' | 'thinking' | 'speaking';
 
-// Silence after a finalised phrase before the caller's turn is sent. Long
-// enough to survive a mid-sentence pause, short enough to feel responsive.
-const END_OF_TURN_MS = 800;
+// Silence after a finalised phrase before the caller's turn is sent. A fixed
+// short wait cuts people off while they think; a long one makes every answer
+// feel slow. So the wait depends on how finished the words sound.
+const END_OF_TURN_SHORT_MS = 700; // "yes", "no", "that's right"
+const END_OF_TURN_MS = 1400;
+const END_OF_TURN_UNFINISHED_MS = 2600; // "...because", "...um", "...and my"
+const SHORT_ANSWER = /^(yes|yeah|yep|yup|no|nope|nah|correct|right|that's right|okay|ok|sure|sounds good|perfect)\b[\w\s']{0,12}$/i;
+const UNFINISHED = /\b(and|but|so|or|because|cause|like|um+|uh+|er+|hmm+|the|a|an|my|to|of|for|with|about|is|was|i|i'm|it's|that|which|then|since|if|when|just|maybe|it|been)\s*$/i;
+// Speaker mode: keep the mic off this long after the agent stops talking, so
+// the tail of its own voice isn't picked up.
+const SPEAKER_TAIL_MS = 350;
+
+function endOfTurnDelay(text: string): number {
+  const trimmed = text.trim();
+  if (SHORT_ANSWER.test(trimmed)) return END_OF_TURN_SHORT_MS;
+  if (UNFINISHED.test(trimmed)) return END_OF_TURN_UNFINISHED_MS;
+  return END_OF_TURN_MS;
+}
 // If the reply hasn't arrived by now, say something so the line isn't dead.
 const FILLER_AFTER_MS = 1800;
 const FILLERS = ['One moment.', 'Okay, one second.', 'Let me check that.'];
@@ -16,11 +31,17 @@ const BARGE_IN_MIN_WORDS = 2;
 interface UseVoiceCallOptions {
   /** Send one caller turn; resolve with the reply to speak (or null). */
   onTurn: (text: string) => Promise<string | null>;
+  /**
+   * true: earphones, mic stays live so the caller can interrupt.
+   * false: speaker mode, mic is off while the agent talks so it can't hear
+   * itself, at the cost of interruptions.
+   */
+  bargeIn: boolean;
 }
 
 const words = (text: string) => text.toLowerCase().match(/[a-z0-9']+/g) || [];
 
-export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
+export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
   const [supported, setSupported] = useState(true);
   const [active, setActive] = useState(false);
   const [status, setStatus] = useState<VoiceStatus>('off');
@@ -36,6 +57,11 @@ export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const onTurnRef = useRef(onTurn);
   onTurnRef.current = onTurn;
+  const bargeInRef = useRef(bargeIn);
+  bargeInRef.current = bargeIn;
+  // Speaker mode: true while the mic is deliberately off for agent speech.
+  const micPausedRef = useRef(false);
+  const resumeTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const w = window as any;
@@ -54,6 +80,37 @@ export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
     window.speechSynthesis.onvoiceschanged = pickVoice;
   }, []);
 
+  // Speaker mode: abort recognition while the agent talks (anything heard then
+  // is the agent itself) and restart it shortly after it stops.
+  const pauseMic = () => {
+    if (resumeTimerRef.current) {
+      window.clearTimeout(resumeTimerRef.current);
+      resumeTimerRef.current = null;
+    }
+    if (micPausedRef.current) return;
+    micPausedRef.current = true;
+    try {
+      recognitionRef.current?.abort();
+    } catch {
+      /* not running */
+    }
+  };
+
+  const resumeMicSoon = () => {
+    if (resumeTimerRef.current) window.clearTimeout(resumeTimerRef.current);
+    resumeTimerRef.current = window.setTimeout(() => {
+      resumeTimerRef.current = null;
+      if (window.speechSynthesis.speaking) return; // the next utterance resumes it
+      micPausedRef.current = false;
+      if (!activeRef.current) return;
+      try {
+        recognitionRef.current?.start();
+      } catch {
+        /* already started */
+      }
+    }, SPEAKER_TAIL_MS);
+  };
+
   const idleStatus = useCallback((): VoiceStatus => {
     if (!activeRef.current) return 'off';
     return thinkingRef.current ? 'thinking' : 'listening';
@@ -69,10 +126,14 @@ export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
         utterance.onstart = () => {
           spokenRef.current = text;
           setStatus('speaking');
+          if (!bargeInRef.current) pauseMic();
         };
         const done = () => {
           spokenRef.current = '';
-          if (!window.speechSynthesis.speaking) setStatus(idleStatus());
+          if (!window.speechSynthesis.speaking) {
+            setStatus(idleStatus());
+            if (micPausedRef.current) resumeMicSoon();
+          }
           resolve();
         };
         utterance.onend = done;
@@ -134,6 +195,7 @@ export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
     recognition.lang = 'en-US';
 
     recognition.onresult = (event: any) => {
+      if (micPausedRef.current) return; // speaker mode: agent is talking
       let pending = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
@@ -158,13 +220,14 @@ export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
 
       if (bufferRef.current && !live) {
         if (endTimerRef.current) window.clearTimeout(endTimerRef.current);
-        endTimerRef.current = window.setTimeout(() => flushRef.current(), END_OF_TURN_MS);
+        endTimerRef.current = window.setTimeout(() => flushRef.current(), endOfTurnDelay(bufferRef.current));
       }
     };
 
-    // Chrome ends recognition after a stretch of silence; keep it alive.
+    // Chrome ends recognition after a stretch of silence; keep it alive
+    // (unless speaker mode switched it off on purpose).
     recognition.onend = () => {
-      if (!activeRef.current) return;
+      if (!activeRef.current || micPausedRef.current) return;
       try {
         recognition.start();
       } catch {
@@ -203,7 +266,9 @@ export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
     setStatus('off');
     setInterim('');
     bufferRef.current = '';
+    micPausedRef.current = false;
     if (endTimerRef.current) window.clearTimeout(endTimerRef.current);
+    if (resumeTimerRef.current) window.clearTimeout(resumeTimerRef.current);
     try {
       recognitionRef.current?.stop();
     } catch {

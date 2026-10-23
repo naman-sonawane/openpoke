@@ -136,7 +136,26 @@ export default function Page() {
     [refresh],
   );
 
-  const voice = useVoiceCall({ onTurn: sendTurn });
+  // Earphones let the caller interrupt; on a speaker the mic must be off while
+  // the agent talks or it hears itself. Remembered per device.
+  const [earphones, setEarphones] = useState(false);
+  useEffect(() => {
+    try {
+      setEarphones(window.localStorage.getItem('intake.earphones') === '1');
+    } catch {
+      /* storage unavailable */
+    }
+  }, []);
+  const toggleEarphones = useCallback((value: boolean) => {
+    setEarphones(value);
+    try {
+      window.localStorage.setItem('intake.earphones', value ? '1' : '0');
+    } catch {
+      /* storage unavailable */
+    }
+  }, []);
+
+  const voice = useVoiceCall({ onTurn: sendTurn, bargeIn: earphones });
 
   const startNewCall = useCallback(async () => {
     window.speechSynthesis?.cancel();
@@ -181,7 +200,16 @@ export default function Page() {
             <h1 className="text-lg font-semibold">Maple Street Family Medicine</h1>
             <p className="text-sm text-gray-500">Voice intake and scheduling</p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {voice.supported && (
+              <label
+                className="flex items-center gap-1.5 text-sm text-gray-600"
+                title="On: you can interrupt the agent. Off (speaker): the mic pauses while the agent talks so it can't hear itself."
+              >
+                <input type="checkbox" checked={earphones} onChange={(e) => toggleEarphones(e.target.checked)} />
+                Earphones
+              </label>
+            )}
             {voice.supported ? (
               <button
                 className={clsx(
