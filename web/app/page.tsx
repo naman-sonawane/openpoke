@@ -76,12 +76,20 @@ export default function Page() {
     }
   }, []);
 
+  // A demo switch the user just clicked wins over a poll that was already in
+  // flight, until the server has had time to store it.
+  const pendingDemoRef = useRef<{ values: Record<string, boolean>; until: number } | null>(null);
+
   const loadIntakeState = useCallback(async () => {
     const id = callIdRef.current;
     if (!id) return;
     try {
       const res = await fetch(`/api/intake/state?call_id=${id}`, { cache: 'no-store' });
-      if (res.ok && callIdRef.current === id) setIntakeState(await res.json());
+      if (!res.ok || callIdRef.current !== id) return;
+      const next = await res.json();
+      const pending = pendingDemoRef.current;
+      if (pending && Date.now() < pending.until) next.demo = { ...next.demo, ...pending.values };
+      setIntakeState(next);
     } catch (err) {
       console.debug('Failed to load intake state', err);
     }
@@ -194,6 +202,8 @@ export default function Page() {
   const toggleDemo = useCallback(
     async (key: 'fail_next_tool' | 'slot_conflict', value: boolean) => {
       // Show the change at once; the next poll confirms what the server stored.
+      const values = { ...(pendingDemoRef.current?.values ?? {}), [key]: value };
+      pendingDemoRef.current = { values, until: Date.now() + 3000 };
       setIntakeState((prev) => (prev ? { ...prev, demo: { ...prev.demo, [key]: value } } : prev));
       await fetch('/api/intake/demo', {
         method: 'POST',

@@ -171,6 +171,9 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         category="medical",
         definite=(
             r"throat (is )?(closing|swelling|swollen|tight)",
+            # A known allergen plus a tight or swelling throat is a severe
+            # allergic reaction in any wording; don't spend a turn asking.
+            r"\b(stung|sting|bee|wasp|hornet|peanuts?|nuts?|shellfish|allerg\w*)\b.*\b(throat|tongue|lips?)\b.*\b(tight\w*|clos\w*|swell\w*|swollen)\b",
             r"(tongue|lips?) (is |are )?(swelling|swollen)",
             r"used (my|his|her|their|an) epi-?pen",
         ),

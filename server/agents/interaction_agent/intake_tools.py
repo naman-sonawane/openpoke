@@ -66,8 +66,16 @@ INTAKE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                     **_NULLABLE_BOOL,
                     "description": "Pregnant, an infant, immunocompromised, or otherwise high-risk, if the caller said so.",
                 },
+                "acknowledgement": {
+                    "type": "string",
+                    "description": (
+                        "One short, kind sentence you will say first, responding specifically to what the caller "
+                        "described (e.g. 'Two days of a sore throat and fever sounds miserable.'). For a check-up "
+                        "or refill, a simple 'Thanks for that.' is fine."
+                    ),
+                },
             },
-            "required": ["reason_for_visit", "visit_type"],
+            "required": ["reason_for_visit", "visit_type", "acknowledgement"],
         },
     },
     "check_availability": {
@@ -139,8 +147,12 @@ INTAKE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                     ],
                 },
                 "note": {"type": "string", "description": "One or two sentences for the staff member picking up."},
+                "about_someone_else": {
+                    "type": "boolean",
+                    "description": "True if the caller asked for another person's results, records or appointments.",
+                },
             },
-            "required": ["reason", "note"],
+            "required": ["reason", "note", "about_someone_else"],
         },
     },
 }

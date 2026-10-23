@@ -19,6 +19,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional, Sequence
 
 from ...config import get_settings
@@ -36,11 +37,11 @@ You are the safety check on a doctor's office phone line. Read the caller's late
 
 Warning signs (judge by meaning, not exact words; this list is not exhaustive):
 - chest pain or pressure; trouble breathing or turning blue; stroke signs (face drooping, arm or leg weakness, slurred speech, sudden confusion, sudden vision loss); fainting, unresponsiveness or seizure; heavy bleeding that won't stop; severe allergic reaction (throat, tongue or lip swelling); possible overdose or poisoning; a sudden, worst-ever headache.
-- High-risk groups, where ordinary-sounding symptoms are urgent: any fever in a baby under three months old; in pregnancy, a severe headache, vision changes, bleeding, leaking fluid, much less movement from the baby, or severe belly pain; a young child who is very hard to wake, floppy, or not drinking; an older adult with sudden confusion, or a fall with a head injury.
+- High-risk groups, where ordinary-sounding symptoms are urgent (work out ages from any date of birth using today's date): any fever in a baby under three months old; in pregnancy, a severe headache, vision changes, bleeding, leaking fluid, much less movement from the baby, or severe belly pain; a young child who is very hard to wake, floppy, or not drinking; an older adult with sudden confusion, or a fall with a head injury.
 - Thoughts of suicide or of harming themselves (category "crisis").
 
 Reply with JSON only, no other text:
-{{"verdict": "emergency" | "ask" | "denied" | "none", "category": "medical" | "crisis", "question": "<only for ask>", "reason": "<a few words>"}}
+{{"verdict": "emergency" | "ask" | "denied" | "none", "category": "medical" | "crisis", "acknowledgement": "<only for ask>", "question": "<only for ask>", "reason": "<a few words>"}}
 
 - "emergency": a warning sign, or a high-risk situation above, is happening now or started recently and hasn't gone away. Examples: "I've had crushing chest pain for half an hour", "got stung and my throat feels tight", "my 6-week-old has a fever". Any recent possible overdose or poisoning is an emergency; don't ask for amounts.
 - "ask": something on the list may be happening now but it's genuinely unclear whether it is or how serious it is: "my chest feels kind of tight sometimes", "a bit short of breath", "my heart's been racing". Or they ask about a warning sign in a way that suggests they might have it.
@@ -48,7 +49,9 @@ Reply with JSON only, no other text:
 - "none": nothing on the list comes up. Ordinary reasons to call (sore throat, cough, refill, back pain, rash, check-up, billing, names, dates, scheduling) are "none". Most turns are "none".
 - If it may be happening now and could be serious, choose emergency over ask. If they plainly deny it, choose denied over ask. Don't choose ask for ordinary complaints.
 
-For "ask", write one short, warm, natural yes/no question that fits the conversation and settles whether it's happening right now. Exactly one question: no follow-ups, no asking for amounts or details, no lists of symptoms. Don't repeat their words back word for word, don't explain why you're asking, don't reassure or assess. Example: "Just so I'm sure, are you feeling any tightness or pressure in your chest right now?"
+For "ask", fill both fields; the receptionist says them in order:
+- "acknowledgement": one short, kind sentence that responds to what the caller just told you, specific to it, with no question and no medical reassurance. Example: "I'm sorry, that sounds really uncomfortable."
+- "question": one natural yes/no question that settles whether it's happening right now. Ask only that: never what it feels like, where it is, amounts, or other details, and no lists of symptoms. Exactly one question mark. Example: "Is your chest feeling tight right now?"
 """
 
 _ANSWER_PROMPT = """\
@@ -96,7 +99,7 @@ def _usable_question(question: Optional[str]) -> bool:
     return (
         question.endswith("?")
         and question.count("?") == 1
-        and len(question) <= 160
+        and len(question) <= 200  # room for a short acknowledgement before the question
         and not _ADVICE_RE.search(question)
     )
 
@@ -110,7 +113,10 @@ async def _call(system: str, context: str, caller_text: str) -> str:
             messages=[
                 {
                     "role": "user",
-                    "content": f"<recent_conversation>\n{context or 'None'}\n</recent_conversation>\n"
+                    # Today's date: without it the model can't tell a 3-year-old
+                    # from a newborn given only a date of birth.
+                    "content": f"<today>{date.today().strftime('%B %d, %Y')}</today>\n"
+                    f"<recent_conversation>\n{context or 'None'}\n</recent_conversation>\n"
                     f"<caller_latest>\n{caller_text}\n</caller_latest>",
                 }
             ],
@@ -165,7 +171,8 @@ async def screen_turn(
 
     if data is None:
         if hints:
-            return TriageResult("ask", hints[0].question, "triage unavailable", "fallback", hints[0].category)
+            return TriageResult("ask", _with_ack(None, hints[0].question), "triage unavailable", "fallback",
+                                hints[0].category)
         return TriageResult("none", reason="triage unavailable", source="fallback")
     category = "crisis" if data.get("category") == "crisis" else "medical"
     question = (data.get("question") or "").strip() or None
@@ -175,8 +182,29 @@ async def screen_turn(
             # without a keyword to fall back on, hand the turn on as normal
             # rather than ask something malformed.
             return TriageResult("none", reason="no usable question", source="fallback")
-        return TriageResult("ask", hints[0].question, data.get("reason", ""), "fallback", hints[0].category)
+        return TriageResult("ask", _with_ack(None, hints[0].question), data.get("reason", ""), "fallback",
+                            hints[0].category)
+    if data["verdict"] == "ask":
+        question = _with_ack(data.get("acknowledgement"), question)
     return TriageResult(data["verdict"], question, data.get("reason", ""), category=category)
+
+
+DEFAULT_ACKNOWLEDGEMENT = "I'm sorry to hear that."
+
+
+def _with_ack(acknowledgement: Optional[str], question: str) -> str:
+    """Put a kind sentence before the safety question. Asked as a separate
+    field because, folded into the question, the model often dropped it; a
+    missing or unsuitable one falls back to a plain default."""
+
+    acknowledgement = (acknowledgement or "").strip()
+    usable = (
+        acknowledgement
+        and "?" not in acknowledgement
+        and len(acknowledgement) <= 140
+        and not _ADVICE_RE.search(acknowledgement)
+    )
+    return f"{acknowledgement if usable else DEFAULT_ACKNOWLEDGEMENT} {question}"
 
 
 async def judge_answer(labels: str, question: str, caller_text: str, context: str) -> TriageResult:
@@ -198,6 +226,8 @@ async def judge_answer(labels: str, question: str, caller_text: str, context: st
 
     if data is None:
         verdict = {"yes": "emergency", "no": "denied", "unclear": "unclear"}[classify_confirmation(caller_text)]
+        if verdict == "unclear" and _AFFIRMATIVE_RE.search(caller_text.lower()):
+            verdict = "emergency"  # "it kind of comes and goes": doubt is a yes here too
         return TriageResult(verdict, reason="keyword fallback", source="fallback")
     # Code may only overrule the model towards safety: an answer the model
     # couldn't place that contains any affirmative ("I mean... yeah?") is a yes.
@@ -206,4 +236,6 @@ async def judge_answer(labels: str, question: str, caller_text: str, context: st
     return TriageResult(data["verdict"], reason=data.get("reason", ""))
 
 
-_AFFIRMATIVE_RE = re.compile(r"\b(yes|yeah|yea|yep|yup|a little|a bit|kind of|kinda|sort of|maybe|i think so)\b")
+_AFFIRMATIVE_RE = re.compile(
+    r"\b(yes|yeah|yea|yep|yup|a little|a bit|kind of|kinda|sort of|maybe|i think so|sometimes|on and off)\b"
+)

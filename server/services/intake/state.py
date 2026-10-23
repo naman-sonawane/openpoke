@@ -67,6 +67,9 @@ class CallState:
     cleared_flags: List[str] = field(default_factory=list)
     # The exact safety questions answered no, so the screen never re-asks them.
     answered_no: List[str] = field(default_factory=list)
+    # Words a tool decided must open the next reply (an acknowledgement, a
+    # privacy refusal). The runtime makes sure they are actually spoken.
+    reply_opener: Optional[str] = None
     # Caller ruled it out unprompted ("no chest pain"): never asked about.
     denied_flags: List[str] = field(default_factory=list)
     tool_failures: int = 0

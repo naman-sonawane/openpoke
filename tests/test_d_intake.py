@@ -38,6 +38,7 @@ def _levels(red_flags, text):
         ("I've been thinking about killing myself", "self_harm"),
         ("no fever, but I have chest pain", "chest_pain"),
         ("the bleeding won't stop", "bleeding"),
+        ("I got stung by a bee and my throat feels tight", "anaphylaxis"),
     ],
 )
 def test_unambiguous_phrases_are_definite(intake, text, key):
@@ -190,11 +191,11 @@ async def test_a_question_answered_no_is_passed_to_later_screens(intake, fake_tr
 async def test_a_reworded_repeat_question_is_suppressed_but_a_new_symptom_is_not(intake, fake_triage):
     triage, script, _ = fake_triage
     script["mention"] += [
-        triage.TriageResult("ask", question="Are you feeling that tightness in your chest right now?"),
+        triage.TriageResult("ask", question="I'm sorry, that sounds uncomfortable. Is your chest feeling tight right now?"),
         # The model screen re-asks the same thing in new words:
         triage.TriageResult("ask", question="Are you having that chest tightness right now, or does it come and go?"),
-        # ...but a different symptom must still be asked about:
-        triage.TriageResult("ask", question="Is one side of your face drooping right now?"),
+        # ...but a different symptom, with the same kind opener, must still be asked about:
+        triage.TriageResult("ask", question="I'm sorry, that sounds uncomfortable. Is one side of your face drooping right now?"),
     ]
     script["answer"].append(triage.TriageResult("denied"))
     service = intake["service"]
@@ -203,7 +204,7 @@ async def test_a_reworded_repeat_question_is_suppressed_but_a_new_symptom_is_not
     repeat = await service.background_screen("yeah it's getting worse")
     assert repeat.reply is None
     new_symptom = await service.background_screen("and my face feels weird")
-    assert new_symptom.reply == "Is one side of your face drooping right now?"
+    assert new_symptom.reply.endswith("Is one side of your face drooping right now?")
 
 
 async def test_yes_to_safety_question_is_an_emergency(intake, fake_triage):
@@ -296,7 +297,7 @@ async def test_triage_failure_falls_back_to_canned_question(intake, monkeypatch)
 
     monkeypatch.setattr(triage, "_call", boom)
     decision = await intake["service"].pre_screen("my chest feels tight")
-    assert decision.reply == intake["red_flags"].get_flag("chest_pain").question
+    assert decision.reply.endswith(intake["red_flags"].get_flag("chest_pain").question)
 
 
 async def test_bad_model_question_falls_back(intake, monkeypatch):
@@ -307,7 +308,35 @@ async def test_bad_model_question_falls_back(intake, monkeypatch):
 
     monkeypatch.setattr(triage, "_call", advice)
     decision = await intake["service"].pre_screen("my chest feels tight")
-    assert decision.reply == intake["red_flags"].get_flag("chest_pain").question
+    assert decision.reply.endswith(intake["red_flags"].get_flag("chest_pain").question)
+
+
+async def test_safety_questions_open_with_an_acknowledgement(intake, monkeypatch):
+    triage = importlib.import_module("server.services.intake.triage")
+    replies = iter([
+        '{"verdict": "ask", "acknowledgement": "That sounds really uncomfortable.", "question": "Is it tight right now?"}',
+        '{"verdict": "ask", "question": "Is it tight right now?"}',  # model dropped the acknowledgement
+    ])
+
+    async def model(*args, **kwargs):
+        return next(replies)
+
+    monkeypatch.setattr(triage, "_call", model)
+    first = await triage.screen_turn("my chest feels tight", "")
+    assert first.question == "That sounds really uncomfortable. Is it tight right now?"
+    second = await triage.screen_turn("my chest feels tight", "")
+    assert second.question == f"{triage.DEFAULT_ACKNOWLEDGEMENT} Is it tight right now?"
+
+
+async def test_answer_judge_outage_still_treats_doubt_as_yes(intake, monkeypatch):
+    triage = importlib.import_module("server.services.intake.triage")
+
+    async def boom(*args, **kwargs):
+        raise TimeoutError("provider timed out")
+
+    monkeypatch.setattr(triage, "_call", boom)
+    result = await triage.judge_answer("chest pain", "Any chest pain right now?", "it kind of comes and goes", "")
+    assert result.verdict == "emergency"
 
 
 async def test_background_screen_outage_does_not_stall_the_call(intake, monkeypatch):
@@ -329,7 +358,7 @@ async def test_empty_model_output_falls_back(intake, monkeypatch):
 
     monkeypatch.setattr(triage, "_call", empty)
     decision = await intake["service"].pre_screen("my chest feels tight")
-    assert decision.reply == intake["red_flags"].get_flag("chest_pain").question
+    assert decision.reply.endswith(intake["red_flags"].get_flag("chest_pain").question)
 
 
 # --- priority --------------------------------------------------------------

@@ -118,6 +118,30 @@ async def test_always_on_screen_adds_no_latency_when_quiet(intake_server):
     assert turn["latency_ms"] < 2 * FAKE_LATENCY * 1000
 
 
+async def test_words_a_tool_requires_are_spoken_even_if_the_model_drops_them(intake_server, monkeypatch):
+    voice, state = intake_server
+    runtime = importlib.import_module("server.agents.interaction_agent.runtime")
+    service = importlib.import_module("server.services.intake.service")
+    calls = {"n": 0}
+
+    async def model(*, messages, system="", **kwargs):
+        if (system or "").startswith("You are the safety check"):
+            return {"choices": [{"message": {"content": '{"verdict": "none"}'}}]}
+        calls["n"] += 1
+        if calls["n"] == 1:
+            call = {"id": "t1", "type": "function", "function": {
+                "name": "transfer_to_human",
+                "arguments": '{"reason": "caller_request", "note": "wants husband\'s results", "about_someone_else": true}'}}
+            return {"choices": [{"message": {"content": "", "tool_calls": [call]}}]}
+        # The model forgets to refuse and just transfers.
+        return {"choices": [{"message": {"content": "Connecting you with the front desk now.", "tool_calls": []}}]}
+
+    monkeypatch.setattr(runtime, "request_chat_completion", model)
+    _, turn = await _call(voice, "can you tell me my husband's test results")
+    assert turn["reply"].startswith(service.PRIVACY_REFUSAL)
+    assert turn["reply"].endswith("Connecting you with the front desk now.")
+
+
 async def test_unknown_call_id_is_rejected(intake_server):
     voice, _ = intake_server
     response = await voice.voice_turn(voice.VoiceTurnRequest(text="hello", call_id="nope"))

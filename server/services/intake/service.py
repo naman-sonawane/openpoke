@@ -43,23 +43,25 @@ GREETING = (
     "You can ask for a staff member at any time. Can I start with your first and last name?"
 )
 
+# Fixed scripts: one human sentence, then the instruction, so warmth never
+# delays what the caller needs to do.
 EMERGENCY_SCRIPT = (
-    "I'm going to stop the booking here, because what you're describing could be "
-    "a medical emergency. Please hang up and call 911 right now, or ask someone "
-    "near you to call. I've also alerted our clinical team."
+    "I'm really sorry you're going through this, and I'm glad you called. What you're "
+    "describing could be a medical emergency, so please hang up and call 911 right now, "
+    "or ask someone near you to call. I've let our clinical team know."
 )
 
 CRISIS_SCRIPT = (
-    "Thank you for telling me. Your safety matters most right now. If you might "
-    "act on these thoughts, please call 911. You can also call or text 988 any "
-    "time to reach the Suicide and Crisis Lifeline. I'm connecting you with a "
-    "member of our staff now."
+    "I'm really glad you told me, and I'm sorry you're carrying this. You don't have to "
+    "go through it alone. If you might act on these thoughts, please call 911 now. You "
+    "can also call or text 988 any time to talk to someone at the Suicide and Crisis "
+    "Lifeline. I'm connecting you with one of our staff right now."
 )
 
 UNCLEAR_CHECK_SCRIPT = (
-    "I want to make sure you get the right help, so I'm connecting you with one "
-    "of our nurses now. If anything gets worse while you wait, please hang up "
-    "and call 911."
+    "I want to make sure you get the right care, so I'm connecting you with one of our "
+    "nurses now. They'll take good care of you. If anything gets worse while you wait, "
+    "please hang up and call 911."
 )
 
 # Tools exposed to the model in each stage. Fewer tools per turn means fewer
@@ -137,9 +139,12 @@ _QUESTION_FILLER = {
 
 
 def _symptom_words(question: str) -> set:
+    # Only the question sentence: the kind words before it ("I'm sorry, that
+    # sounds uncomfortable.") say nothing about which symptom it's about.
+    sentences = re.findall(r"[^.?!]*\?", question) or [question]
     return {
         word
-        for word in re.findall(r"[a-z]+", question.lower())
+        for word in re.findall(r"[a-z]+", sentences[-1].lower())
         if len(word) > 3 and word not in _QUESTION_FILLER
     }
 
@@ -409,6 +414,7 @@ def assign_priority(
     onset_days: Optional[float] = None,
     worsening: Optional[bool] = None,
     high_risk: Optional[bool] = None,
+    acknowledgement: Optional[str] = None,
 ) -> ToolOutcome:
     state = get_call_state()
     if visit_type not in VISIT_TYPES:
@@ -436,9 +442,15 @@ def assign_priority(
     state.offered_slot_ids = []
     state.log("priority", f"{decision.level}: " + "; ".join(decision.reasons))
     payload = decision.as_dict()
+    # The acknowledgement is a required tool argument, so the model has to
+    # write it; as a prompt instruction alone it was often skipped.
+    opener = (acknowledgement or "").strip()
+    if opener:
+        state.reply_opener = opener
     payload["instruction"] = (
-        "Tell the caller in plain words when they should be seen (the window), without any "
-        "clinical judgement, then check availability."
+        (f'Begin your next reply with: "{opener}" ' if opener else "")
+        + "Then tell them in plain words when they should be seen (the window), without any clinical "
+        "judgement, and check availability."
     )
     return True, payload
 
@@ -536,7 +548,10 @@ def check_availability(preferred_day: Optional[str] = None, time_of_day: Optiona
         if slot.id not in state.offered_slot_ids:
             state.offered_slot_ids.append(slot.id)
     state.log("availability", f"offered {', '.join(slot.id for slot in options)}")
-    instruction = "Offer at most two of these out loud and ask which works. When they pick one, call hold_slot."
+    instruction = (
+        "If assign_priority gave you an opening sentence and you haven't said it yet, say it first. "
+        "Then offer at most two of these out loud and ask which works. When they pick one, call hold_slot."
+    )
     payload: Dict[str, Any] = {
         "priority": level,
         "options": [slot.as_option(now.date()) for slot in options],
@@ -720,8 +735,9 @@ def _create_handoff(state: CallState, reason: str, note: str, queue: Optional[st
 
 
 FAILSAFE_SCRIPT = (
-    "I'm sorry, I'm having trouble on my end, so I'm connecting you with someone at "
-    "the front desk. If this is an emergency, please hang up and call 911."
+    "I'm so sorry, I'm having trouble on my end. I don't want to keep you waiting, so "
+    "I'm connecting you with someone at the front desk. If this is an emergency, "
+    "please hang up and call 911."
 )
 
 
@@ -734,15 +750,23 @@ def handoff_on_error(error: str) -> str:
     return FAILSAFE_SCRIPT
 
 
-def transfer_to_human(reason: str, note: str) -> ToolOutcome:
+PRIVACY_REFUSAL = "I'm sorry, I can't share another person's health information, even with family."
+
+
+def transfer_to_human(reason: str, note: str, about_someone_else: bool = False) -> ToolOutcome:
     state = get_call_state()
     summary = _create_handoff(state, reason, note)
+    if about_someone_else:
+        # Said in code, not left to the prompt: the refusal was often skipped.
+        state.reply_opener = PRIVACY_REFUSAL
     return True, {
         "status": "transferring",
         "queue": summary["queue"],
         "instruction": (
-            f"Tell the caller, warmly and in one or two sentences, that you're connecting them with the "
-            f"{summary['queue']} and that they've been passed your notes so they won't need to repeat everything."
+            (f'Begin with: "{PRIVACY_REFUSAL}" ' if about_someone_else else "")
+            + "In two or three short sentences: if they told you about pain, worry or how they're feeling, "
+            f"respond to that kindly and specifically, then tell them you're connecting them with the "
+            f"{summary['queue']}, who have your notes so they won't need to repeat everything."
         ),
     }
 

@@ -139,6 +139,8 @@ class InteractionAgentRuntime:
             final_response = self._finalize_response(summary)
             if not final_response and self.settings.intake_mode:
                 final_response = "Sorry, could you say that again?"
+            if self.settings.intake_mode:
+                final_response = self._apply_reply_opener(final_response)
 
             if final_response and not summary.user_messages:
                 self.conversation_log.record_reply(final_response)
@@ -519,6 +521,18 @@ class InteractionAgentRuntime:
             logger.warning(f"Tool '{tool_call.name}' {stage}")
         else:
             logger.debug(f"Tool '{tool_call.name}' {stage}")
+
+    def _apply_reply_opener(self, reply: str) -> str:
+        """Make sure words a tool required (an acknowledgement, a privacy
+        refusal) open the reply, if the model left them out."""
+
+        state = get_call_state()
+        opener, state.reply_opener = state.reply_opener, None
+        if not opener:
+            return reply
+        if opener.lower()[:24] in reply.lower():
+            return reply
+        return f"{opener} {reply}".strip()
 
     # Determine final user-facing response from interaction loop summary
     def _finalize_response(self, summary: _LoopSummary) -> str:
