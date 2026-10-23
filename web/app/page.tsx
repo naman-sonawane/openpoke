@@ -148,26 +148,22 @@ export default function Page() {
     [refresh],
   );
 
-  // Earphones let the caller interrupt; on a speaker the mic must be off while
-  // the agent talks or it hears itself. Remembered per device.
-  const [earphones, setEarphones] = useState(false);
-  useEffect(() => {
-    try {
-      setEarphones(window.localStorage.getItem('intake.earphones') === '1');
-    } catch {
-      /* storage unavailable */
-    }
-  }, []);
-  const toggleEarphones = useCallback((value: boolean) => {
-    setEarphones(value);
-    try {
-      window.localStorage.setItem('intake.earphones', value ? '1' : '0');
-    } catch {
-      /* storage unavailable */
-    }
-  }, []);
+  // On laptop or phone speakers the mic would pick up the agent's own voice,
+  // so it pauses while the agent talks. Interrupting is explicit instead:
+  // Space, or a tap on the status bar.
+  const voice = useVoiceCall({ onTurn: sendTurn, bargeIn: false });
 
-  const voice = useVoiceCall({ onTurn: sendTurn, bargeIn: earphones });
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const typing = (event.target as HTMLElement)?.tagName === 'INPUT';
+      if (event.code === 'Space' && !typing && voice.status === 'speaking') {
+        event.preventDefault();
+        voice.interrupt();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [voice]);
 
   const startNewCall = useCallback(async () => {
     window.speechSynthesis?.cancel();
@@ -222,15 +218,6 @@ export default function Page() {
             <p className="text-sm text-gray-500">Voice intake and scheduling</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            {voice.supported && (
-              <label
-                className="flex items-center gap-1.5 text-sm text-gray-600"
-                title="On: you can interrupt the agent. Off (speaker): the mic pauses while the agent talks so it can't hear itself."
-              >
-                <input type="checkbox" checked={earphones} onChange={(e) => toggleEarphones(e.target.checked)} />
-                Earphones
-              </label>
-            )}
             {voice.supported ? (
               <button
                 className={clsx(
@@ -252,7 +239,13 @@ export default function Page() {
 
         <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
           <div className="card flex flex-col overflow-hidden">
-            <div className="flex items-center gap-2 border-b border-gray-100 px-4 py-2 text-sm text-gray-600">
+            <div
+              className={clsx(
+                'flex items-center gap-2 border-b border-gray-100 px-4 py-2 text-sm text-gray-600',
+                voice.status === 'speaking' && 'cursor-pointer hover:bg-gray-50',
+              )}
+              onClick={voice.status === 'speaking' ? voice.interrupt : undefined}
+            >
               <span
                 className={clsx(
                   'h-2.5 w-2.5 rounded-full',
@@ -263,7 +256,10 @@ export default function Page() {
                 )}
               />
               {STATUS_LABEL[voice.status]}
-              {voice.interim && <span className="truncate italic text-gray-400">“{voice.interim}”</span>}
+              {voice.status === 'speaking' && (
+                <span className="text-xs text-gray-400">Space or tap to interrupt</span>
+              )}
+              {voice.interim &&<span className="truncate italic text-gray-400">“{voice.interim}”</span>}
             </div>
 
             <ChatMessages

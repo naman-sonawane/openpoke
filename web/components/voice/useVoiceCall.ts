@@ -288,5 +288,11 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
   stopRef.current = stop;
   useEffect(() => stop, [stop]);
 
-  return { supported, active, status, interim, start, stop, speak };
+  // Caller cuts the agent off (Space or a tap). Cancelling speech fires the
+  // utterance's error handler, which brings the mic back after a short tail.
+  const interrupt = useCallback(() => {
+    if (window.speechSynthesis?.speaking) window.speechSynthesis.cancel();
+  }, []);
+
+  return { supported, active, status, interim, start, stop, speak, interrupt };
 }
