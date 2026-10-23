@@ -7,6 +7,8 @@ OpenPoke is a simplified, open-source take on [Interaction Company’s](https://
 - Trigger scheduler and background watchers for reminders and "important email" alerts.
 - Next.js web UI that proxies everything through the shared `.env`, so plugging in API keys is the only setup.
 
+> **Voice intake agent:** this fork runs a doctor's-office intake and scheduling receptionist by default. See [docs/voice-intake](docs/voice-intake/README.md) for the flow, safety logic, trade-offs and eval results. Set `OPENPOKE_MODE=assistant` for the original email assistant.
+
 ## Requirements
 - Python 3.10+
 - Node.js 18+
