@@ -28,9 +28,15 @@ const FILLERS = ['One moment.', 'Okay, one second.', 'Let me check that.'];
 // Interim speech needs this many words to count as the caller barging in.
 const BARGE_IN_MIN_WORDS = 2;
 
+export interface TurnResult {
+  reply: string | null;
+  /** The call is over (handed to a person): stop listening after the reply. */
+  endCall?: boolean;
+}
+
 interface UseVoiceCallOptions {
   /** Send one caller turn; resolve with the reply to speak (or null). */
-  onTurn: (text: string) => Promise<string | null>;
+  onTurn: (text: string) => Promise<TurnResult | null>;
   /**
    * true: earphones, mic stays live so the caller can interrupt.
    * false: speaker mode, mic is off while the agent talks so it can't hear
@@ -62,6 +68,7 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
   // Speaker mode: true while the mic is deliberately off for agent speech.
   const micPausedRef = useRef(false);
   const resumeTimerRef = useRef<number | null>(null);
+  const stopRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     const w = window as any;
@@ -167,10 +174,11 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
         void speak(FILLERS[Math.floor(Math.random() * FILLERS.length)]);
       }, FILLER_AFTER_MS);
       try {
-        const reply = await onTurnRef.current(text);
+        const result = await onTurnRef.current(text);
         window.clearTimeout(filler);
         thinkingRef.current = false;
-        if (reply && activeRef.current) await speak(reply);
+        if (result?.reply && activeRef.current) await speak(result.reply);
+        if (result?.endCall) stopRef.current();
       } catch (err) {
         console.error('voice turn failed', err);
       } finally {
@@ -277,6 +285,7 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
     window.speechSynthesis?.cancel();
   }, []);
 
+  stopRef.current = stop;
   useEffect(() => stop, [stop]);
 
   return { supported, active, status, interim, start, stop, speak };

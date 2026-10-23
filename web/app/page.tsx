@@ -1,7 +1,7 @@
 'use client';
 
 import clsx from 'clsx';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSettings } from '@/components/SettingsModal';
 import { ChatInput } from '@/components/chat/ChatInput';
 import { ChatMessages } from '@/components/chat/ChatMessages';
@@ -9,7 +9,7 @@ import { ErrorBanner } from '@/components/chat/ErrorBanner';
 import { useAutoScroll } from '@/components/chat/useAutoScroll';
 import type { ChatBubble } from '@/components/chat/types';
 import { StaffPanel, type IntakeState } from '@/components/intake/StaffPanel';
-import { useVoiceCall, type VoiceStatus } from '@/components/voice/useVoiceCall';
+import { useVoiceCall, type TurnResult, type VoiceStatus } from '@/components/voice/useVoiceCall';
 
 const POLL_INTERVAL_MS = 1500;
 
@@ -53,27 +53,35 @@ export default function Page() {
   const [isWaitingForResponse, setIsWaitingForResponse] = useState(false);
   const [intakeState, setIntakeState] = useState<IntakeState | null>(null);
   const [lastLatencyMs, setLastLatencyMs] = useState<number | null>(null);
+  // Each browser tab is its own call; the server keeps calls apart by id.
+  const [callId, setCallId] = useState<string | null>(null);
+  const callIdRef = useRef<string | null>(null);
+  callIdRef.current = callId;
   const { scrollContainerRef, handleScroll } = useAutoScroll({
     items: messages,
     isWaiting: isWaitingForResponse,
   });
 
   const loadHistory = useCallback(async () => {
+    const id = callIdRef.current;
+    if (!id) return;
     try {
-      const res = await fetch('/api/chat/history', { cache: 'no-store' });
+      const res = await fetch(`/api/voice/transcript?call_id=${id}`, { cache: 'no-store' });
       if (!res.ok) return;
       const data = await res.json();
-      setMessages(toBubbles(data));
+      if (callIdRef.current === id) setMessages(toBubbles(data));
     } catch (err: any) {
       if (err?.name === 'AbortError') return;
-      console.error('Failed to load chat history', err);
+      console.error('Failed to load transcript', err);
     }
   }, []);
 
   const loadIntakeState = useCallback(async () => {
+    const id = callIdRef.current;
+    if (!id) return;
     try {
-      const res = await fetch('/api/intake/state', { cache: 'no-store' });
-      if (res.ok) setIntakeState(await res.json());
+      const res = await fetch(`/api/intake/state?call_id=${id}`, { cache: 'no-store' });
+      if (res.ok && callIdRef.current === id) setIntakeState(await res.json());
     } catch (err) {
       console.debug('Failed to load intake state', err);
     }
@@ -106,9 +114,13 @@ export default function Page() {
 
   // One caller turn, typed or spoken. Waits for the reply instead of polling.
   const sendTurn = useCallback(
-    async (text: string): Promise<string | null> => {
+    async (text: string): Promise<TurnResult | null> => {
       const trimmed = text.trim();
       if (!trimmed) return null;
+      if (!callIdRef.current) {
+        setError('Press New call first.');
+        return null;
+      }
 
       setError(null);
       setIsWaitingForResponse(true);
@@ -118,12 +130,12 @@ export default function Page() {
         const res = await fetch('/api/voice/turn', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: trimmed }),
+          body: JSON.stringify({ text: trimmed, call_id: callIdRef.current }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
         setLastLatencyMs(data.latency_ms ?? null);
-        return data.reply || null;
+        return { reply: data.reply || null, endCall: Boolean(data.call_ended) };
       } catch (err: any) {
         console.error('Failed to send turn', err);
         setError(err?.message || 'Failed to send message');
@@ -162,9 +174,15 @@ export default function Page() {
     setError(null);
     setLastLatencyMs(null);
     try {
-      await fetch('/api/chat/history', { method: 'DELETE' });
+      // A new call gets a new id: nothing to clear, and other calls (other
+      // tabs, other devices) are untouched.
       const res = await fetch('/api/voice/start', { method: 'POST' });
       const data = await res.json();
+      if (!res.ok || !data?.call_id) throw new Error(data?.error || 'Could not start a call');
+      callIdRef.current = data.call_id;
+      setCallId(data.call_id);
+      setMessages([]);
+      setIntakeState(null);
       await refresh();
       if (voice.active && data?.reply) void voice.speak(data.reply);
     } catch (err: any) {
@@ -177,7 +195,7 @@ export default function Page() {
       await fetch('/api/intake/demo', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ [key]: value }),
+        body: JSON.stringify({ [key]: value, call_id: callIdRef.current }),
       });
       void loadIntakeState();
     },
@@ -188,8 +206,11 @@ export default function Page() {
     const value = input;
     if (!value.trim()) return;
     setInput('');
-    const reply = await sendTurn(value);
-    if (reply && voice.active) void voice.speak(reply);
+    const result = await sendTurn(value);
+    if (result?.reply && voice.active) {
+      await voice.speak(result.reply);
+      if (result.endCall) voice.stop();
+    }
   }, [input, sendTurn, voice]);
 
   return (

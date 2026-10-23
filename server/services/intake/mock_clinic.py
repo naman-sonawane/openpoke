@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import random
 import re
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional
@@ -87,6 +88,34 @@ def build_calendar(now: Optional[datetime] = None, seed: int = 7) -> Dict[str, S
     for slot in todays[:2]:
         slot.booked = False
     return slots
+
+
+# One calendar for the whole practice, shared by every concurrent call. Booking
+# goes through try_book so two callers can never take the same slot; in
+# production this is a row lock or conditional update in the scheduling DB.
+_calendar_lock = threading.Lock()
+_calendar: Dict[str, Slot] = build_calendar()
+
+
+def get_calendar() -> Dict[str, Slot]:
+    return _calendar
+
+
+def try_book(slot_id: str) -> bool:
+    """Atomically claim a slot. False if it doesn't exist or is already taken."""
+
+    with _calendar_lock:
+        slot = _calendar.get(slot_id)
+        if slot is None or slot.booked:
+            return False
+        slot.booked = True
+        return True
+
+
+def reset_calendar() -> None:
+    global _calendar
+    with _calendar_lock:
+        _calendar = build_calendar()
 
 
 def digits_only(value: str) -> str:

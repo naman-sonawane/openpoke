@@ -198,6 +198,18 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         question="Has someone taken too much of a medication or swallowed something harmful?",
     ),
     RedFlag(
+        key="infant_fever",
+        label="a fever in a young baby",
+        category="medical",
+        definite=(),
+        possible=(
+            r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|few)[- ](day|week)s?[- ]old\b.*\b(fever|temperature|hot)\b",
+            r"\b(fever|temperature)\b.*\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|few)[- ](day|week)s?[- ]old\b",
+            r"\bnewborn\b.*\b(fever|temperature)\b",
+        ),
+        question="Is the baby younger than three months old?",
+    ),
+    RedFlag(
         key="headache",
         label="a sudden severe headache",
         category="medical",

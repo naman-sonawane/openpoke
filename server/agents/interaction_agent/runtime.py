@@ -1,6 +1,7 @@
 """Interaction Agent Runtime - handles LLM calls for user and agent turns."""
 
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
@@ -10,8 +11,8 @@ from .tools import ToolResult, get_tool_schemas, handle_tool_call
 from ..execution_agent.batch_manager import reset_turn_id, set_turn_id
 from ...config import get_settings
 from ...services.conversation import get_conversation_log, get_working_memory_log
-from ...services.intake import handoff_on_error, pre_screen
-from ...openrouter_client import request_chat_completion
+from ...services.intake import get_call_state, handoff_on_error, pre_screen
+from ...openrouter_client import PRIVATE_FAST_ROUTING, request_chat_completion
 from ...logging_config import logger
 
 
@@ -24,6 +25,8 @@ class InteractionResult:
     error: Optional[str] = None
     execution_agents_used: int = 0
     llm_calls: int = 0
+    # Where the turn's time went: {"gate_ms": .., "llm_ms": [..], "prompt_tokens": [..]}
+    timings: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -44,6 +47,8 @@ class _LoopSummary:
     tool_names: List[str] = field(default_factory=list)
     execution_agents: Set[str] = field(default_factory=set)
     llm_calls: int = 0
+    llm_ms: List[int] = field(default_factory=list)
+    prompt_tokens: List[int] = field(default_factory=list)
 
 
 class InteractionAgentRuntime:
@@ -57,7 +62,7 @@ class InteractionAgentRuntime:
         self.api_key = settings.openrouter_api_key
         self.model = settings.interaction_agent_model
         self.settings = settings
-        self.conversation_log = get_conversation_log()
+        self._shared_log = get_conversation_log()
         self.working_memory_log = get_working_memory_log()
         self.tool_schemas = get_tool_schemas()
 
@@ -65,6 +70,14 @@ class InteractionAgentRuntime:
             raise ValueError(
                 "OpenRouter API key not configured. Set OPENROUTER_API_KEY environment variable."
             )
+
+    @property
+    def conversation_log(self):
+        """OpenPoke's single shared log, or in intake mode the current call's own
+        transcript, so concurrent callers never see each other's conversation."""
+        if self.settings.intake_mode:
+            return get_call_state().transcript
+        return self._shared_log
 
     # Main entry point for processing user messages through the LLM interaction loop
     async def execute(self, user_message: str) -> InteractionResult:
@@ -78,11 +91,16 @@ class InteractionAgentRuntime:
             # The safety screen runs before the model on every caller turn. When
             # it answers (911 script, confirm question) the model is skipped.
             safety_note = None
+            gate_ms = 0
             if self.settings.intake_mode:
+                gate_started = time.perf_counter()
                 decision = await pre_screen(user_message, context=transcript_before[-2000:])
+                gate_ms = round((time.perf_counter() - gate_started) * 1000)
                 if decision.reply:
                     self.conversation_log.record_reply(decision.reply)
-                    return InteractionResult(success=True, response=decision.reply)
+                    return InteractionResult(
+                        success=True, response=decision.reply, timings={"gate_ms": gate_ms, "llm_ms": []}
+                    )
                 safety_note = decision.note
 
             system_prompt = build_system_prompt()
@@ -105,6 +123,11 @@ class InteractionAgentRuntime:
                 response=final_response,
                 execution_agents_used=len(summary.execution_agents),
                 llm_calls=summary.llm_calls,
+                timings={
+                    "gate_ms": gate_ms,
+                    "llm_ms": summary.llm_ms,
+                    "prompt_tokens": summary.prompt_tokens,
+                },
             )
 
         except Exception as exc:
@@ -171,8 +194,11 @@ class InteractionAgentRuntime:
         summary = _LoopSummary()
 
         for iteration in range(self.MAX_TOOL_ITERATIONS):
+            call_started = time.perf_counter()
             response = await self._make_llm_call(system_prompt, messages)
             summary.llm_calls += 1
+            summary.llm_ms.append(round((time.perf_counter() - call_started) * 1000))
+            summary.prompt_tokens.append((response.get("usage") or {}).get("prompt_tokens") or 0)
             assistant_message = self._extract_assistant_message(response)
 
             assistant_content = (assistant_message.get("content") or "").strip()
@@ -222,6 +248,8 @@ class InteractionAgentRuntime:
 
     # Load conversation history, preferring summarized version if available
     def _load_conversation_transcript(self) -> str:
+        if self.settings.intake_mode:
+            return self.conversation_log.load_transcript()  # calls are short; no summarising
         if self.settings.summarization_enabled:
             rendered = self.working_memory_log.render_transcript()
             if rendered.strip():
@@ -257,15 +285,15 @@ class InteractionAgentRuntime:
                 tools=tool_schemas,
             )
         # On a call every model round trip is dead air: route to the fastest
-        # provider (measured ~1.05s -> ~0.75s p50 per call) and cap the reply,
-        # which is one or two spoken sentences anyway.
+        # zero-retention provider (measured ~1.05s -> ~0.6-0.75s p50 per call)
+        # and cap the reply, which is one or two spoken sentences anyway.
         return await request_chat_completion(
             model=self.model,
             messages=messages,
             system=system_prompt,
             api_key=self.api_key,
             tools=tool_schemas,
-            provider={"sort": "latency"},
+            provider=PRIVATE_FAST_ROUTING,
             max_tokens=400,
         )
 
@@ -439,7 +467,10 @@ class InteractionAgentRuntime:
             log_payload.update(detail)
 
         if stage == "done" and result is not None and not result.success:
-            logger.info(f"Tool '{tool_call.name}' returned error: {str(result.payload)[:200]}")
+            # Only the error code: payloads can carry names, numbers or dates
+            # of birth, which must not land in plaintext server logs.
+            code = result.payload.get("error") if isinstance(result.payload, dict) else "error"
+            logger.info(f"Tool '{tool_call.name}' returned error: {str(code)[:80]}")
         elif stage == "done":
             logger.info(f"Tool '{tool_call.name}' completed")
         elif stage in {"error", "rejected"}:

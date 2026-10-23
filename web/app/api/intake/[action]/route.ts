@@ -3,7 +3,8 @@ export const runtime = 'nodejs';
 const serverBase = process.env.PY_SERVER_URL || 'http://localhost:8001';
 
 async function forward(req: Request, action: string) {
-  const url = `${serverBase.replace(/\/$/, '')}/api/v1/intake/${encodeURIComponent(action)}`;
+  const search = new URL(req.url).search; // carries ?call_id=…
+  const url = `${serverBase.replace(/\/$/, '')}/api/v1/intake/${encodeURIComponent(action)}${search}`;
   try {
     const upstream = await fetch(url, {
       method: req.method,

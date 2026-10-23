@@ -10,6 +10,12 @@ from ..config import get_settings
 OpenRouterBaseURL = "https://openrouter.ai/api/v1"
 
 
+#: Provider routing for patient conversations: only providers with zero data
+#: retention, never ones that use prompts for training, fastest first. This
+#: is a stopgap, not HIPAA cover: OpenRouter has no published BAA.
+PRIVATE_FAST_ROUTING: Dict[str, Any] = {"sort": "latency", "zdr": True, "data_collection": "deny"}
+
+
 class OpenRouterError(RuntimeError):
     """Raised when the OpenRouter API returns an error response."""
 

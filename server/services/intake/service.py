@@ -20,6 +20,7 @@ from .mock_clinic import (
     find_patient,
     normalize_dob,
     phone_readback,
+    try_book,
 )
 from . import triage
 from .priority import VISIT_TYPES, assess_priority
@@ -28,9 +29,13 @@ from .state import CallState, get_call_state, get_demo_toggles
 
 ToolOutcome = Tuple[bool, Dict[str, Any]]
 
+# Disclosure up front: AI, not a clinician (CA AB 3030 / AB 489, UT, TX
+# TRAIGA), the call is transcribed (all-party consent states), and a person is
+# available at any time.
 GREETING = (
-    f"Thanks for calling {CLINIC_NAME}. I can help you book an appointment or "
-    "get you to the right person. Can I start with your first and last name?"
+    f"Thanks for calling {CLINIC_NAME}. I'm the practice's automated AI assistant, "
+    "not a person or a clinician, and this call is transcribed for our records. "
+    "You can ask for a staff member at any time. Can I start with your first and last name?"
 )
 
 EMERGENCY_SCRIPT = (
@@ -490,10 +495,15 @@ def book_appointment(slot_id: str, caller_confirmed: bool) -> ToolOutcome:
             "instruction": "Retry with the slot_id of the option the caller chose. Don't mention this to the caller.",
         }
 
-    if toggles.slot_conflict or slot.booked:
-        # Someone else took the slot between offer and booking.
+    if toggles.slot_conflict:
+        # Demo switch: simulate another caller taking it first.
         toggles.slot_conflict = False
-        slot.booked = True
+        try_book(slot_id)
+        claimed = False
+    else:
+        # Atomic across concurrent calls: only one caller can claim a slot.
+        claimed = try_book(slot_id)
+    if not claimed:
         state.offered_slot_ids = [sid for sid in state.offered_slot_ids if sid != slot_id]
         state.log("conflict", f"{slot_id} was taken before booking")
         alternatives = [
@@ -510,7 +520,6 @@ def book_appointment(slot_id: str, caller_confirmed: bool) -> ToolOutcome:
             ),
         }
 
-    slot.booked = True
     confirmation = f"MS-{random.randint(1000, 9999)}"
     state.booking = {
         "confirmation": confirmation,

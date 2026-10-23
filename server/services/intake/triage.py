@@ -23,7 +23,7 @@ from typing import List, Optional, Sequence
 
 from ...config import get_settings
 from ...logging_config import logger
-from ...openrouter_client import request_chat_completion
+from ...openrouter_client import PRIVATE_FAST_ROUTING, request_chat_completion
 from .red_flags import RedFlag
 
 TRIAGE_TIMEOUT_SECONDS = 5.0
@@ -34,7 +34,7 @@ You are the safety check on a doctor's office phone line. A keyword screen notic
 Reply with JSON only, no other text:
 {{"verdict": "emergency" | "denied" | "ask", "question": "<only for ask>", "reason": "<a few words>"}}
 
-- "emergency": the caller (or someone with them) has this warning sign now or it started recently and hasn't gone away, described in a way that could be serious. Examples: "I've had crushing chest pain for half an hour", "got stung and my throat feels tight". Any recent possible overdose or poisoning is an emergency; don't ask for amounts.
+- "emergency": the caller (or someone with them) has this warning sign now or it started recently and hasn't gone away, described in a way that could be serious. Examples: "I've had crushing chest pain for half an hour", "got stung and my throat feels tight". Any recent possible overdose or poisoning is an emergency; don't ask for amounts. Any fever in a baby under three months old is an emergency.
 - "denied": the caller says they don't have it, in any ordinary phrasing ("no chest pain, just a cough", "I don't think I have any chest pain", "my chest doesn't hurt, it's my back"), or the words aren't about a current symptom at all: a past episode that has resolved, a relative's history, medication or appointment names, a figure of speech ("this bill is giving me a heart attack"). Asking someone about a symptom they just said they don't have sounds robotic; don't.
 - "ask": they describe something that may be present now but it's unclear how serious it is: "my chest feels kind of tight sometimes", "a bit short of breath", "my heart's been racing". Or they ask about the symptom in a way that suggests they might have it.
 - If it may be happening now and could be serious, choose emergency over ask. If they plainly deny it, choose denied over ask.
@@ -109,7 +109,7 @@ async def _call(system: str, context: str, caller_text: str) -> str:
                 }
             ],
             api_key=settings.openrouter_api_key,
-            provider={"sort": "latency"},
+            provider=PRIVATE_FAST_ROUTING,
             max_tokens=150,
         ),
         timeout=TRIAGE_TIMEOUT_SECONDS,

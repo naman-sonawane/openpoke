@@ -1,18 +1,29 @@
-"""Per-call state for the intake flow.
+"""Per-call state for the intake flow, for many concurrent calls.
 
-One call at a time, held in memory: this is a demo, and the conversation log
-it sits beside is also a single shared transcript. reset_call_state() is wired
-to DELETE /chat/history so each demo scenario starts clean.
+Each call has an id, its own state and transcript, held in a registry. The
+current call travels in a context variable set by the voice route, so the
+safety gate, tools and prompt builder all reach the right call through
+get_call_state() without threading an id through every signature. Code that
+never sets a call (tests, the probe scripts, the text chat path) gets a
+default call.
+
+The registry is in-process memory. Running several server processes needs it
+in a shared store (Redis or a database) keyed by the same call id.
 """
 
 from __future__ import annotations
 
+import contextvars
 import threading
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
-from .mock_clinic import Slot, build_calendar, phone_readback
+from .mock_clinic import Slot, get_calendar, phone_readback, reset_calendar
+from .transcript import CallTranscript
 
 STAGES = ("identify", "intake", "schedule", "booked", "emergency", "handoff")
 
@@ -30,7 +41,11 @@ class DemoToggles:
 
 @dataclass
 class CallState:
+    call_id: str = "default"
     started_at: datetime = field(default_factory=datetime.now)
+    last_active: float = field(default_factory=time.monotonic)
+    transcript: CallTranscript = field(default_factory=CallTranscript)
+    demo: DemoToggles = field(default_factory=DemoToggles)
     patient: Optional[Dict[str, Any]] = None
     intake: Dict[str, Any] = field(default_factory=dict)
     priority: Optional[Dict[str, Any]] = None
@@ -49,7 +64,11 @@ class CallState:
     denied_flags: List[str] = field(default_factory=list)
     tool_failures: int = 0
     events: List[Dict[str, str]] = field(default_factory=list)
-    calendar: Dict[str, Slot] = field(default_factory=build_calendar)
+
+    @property
+    def calendar(self) -> Dict[str, Slot]:
+        """The practice's shared calendar; every call books against the same one."""
+        return get_calendar()
 
     @property
     def stage(self) -> str:
@@ -100,9 +119,11 @@ class CallState:
             "handoff": self.handoff,
         }
         if self.patient:
+            # Minimum necessary: once verified, the model has no use for the
+            # date of birth, so it stays out of the prompt (staff view adds it).
             view["caller"] = {
                 "name": self.patient["name"],
-                "dob": self.patient["dob"],
+                "verified": not self.patient.get("new_patient", False),
                 "new_patient": self.patient.get("new_patient", False),
             }
         if callback:
@@ -115,30 +136,102 @@ class CallState:
 
     def staff_view(self) -> Dict[str, Any]:
         view = self.prompt_view()
+        if self.patient and view.get("caller"):
+            view["caller"]["dob"] = self.patient["dob"]
+        view["call_id"] = self.call_id
         view["events"] = self.events
         view["pending_safety_check"] = self.pending_question
-        view["demo"] = _toggles.as_dict()
+        view["demo"] = self.demo.as_dict()
         return view
 
 
+# Calls idle this long are dropped. A phone call that silent has ended.
+CALL_IDLE_TIMEOUT_SECONDS = 30 * 60
+MAX_CALLS = 5000
+
+DEFAULT_CALL_ID = "default"
 _lock = threading.Lock()
-_state = CallState()
-_toggles = DemoToggles()
+_calls: Dict[str, CallState] = {DEFAULT_CALL_ID: CallState()}
+_current_call: contextvars.ContextVar[str] = contextvars.ContextVar("intake_call_id", default=DEFAULT_CALL_ID)
+
+
+def _evict_idle_locked() -> None:
+    cutoff = time.monotonic() - CALL_IDLE_TIMEOUT_SECONDS
+    for call_id in [cid for cid, call in _calls.items() if call.last_active < cutoff and cid != DEFAULT_CALL_ID]:
+        del _calls[call_id]
+    if len(_calls) > MAX_CALLS:  # oldest first, as a memory backstop
+        for call_id in sorted(_calls, key=lambda cid: _calls[cid].last_active)[: len(_calls) - MAX_CALLS]:
+            if call_id != DEFAULT_CALL_ID:
+                del _calls[call_id]
+
+
+def start_call() -> CallState:
+    """Open a new call with a fresh id."""
+
+    with _lock:
+        _evict_idle_locked()
+        call = CallState(call_id=uuid.uuid4().hex[:12])
+        _calls[call.call_id] = call
+        return call
+
+
+def find_call(call_id: str) -> Optional[CallState]:
+    with _lock:
+        return _calls.get(call_id)
+
+
+@contextmanager
+def use_call(call_id: str) -> Iterator[CallState]:
+    """Make call_id the current call for everything inside the block."""
+
+    call = find_call(call_id)
+    if call is None:
+        raise KeyError(call_id)
+    call.last_active = time.monotonic()
+    token = _current_call.set(call_id)
+    try:
+        yield call
+    finally:
+        _current_call.reset(token)
 
 
 def get_call_state() -> CallState:
-    return _state
+    call_id = _current_call.get()
+    with _lock:
+        call = _calls.get(call_id)
+        if call is None:  # evicted mid-flight, or the default was cleared
+            call = _calls.setdefault(call_id, CallState(call_id=call_id))
+        return call
 
 
 def get_demo_toggles() -> DemoToggles:
-    return _toggles
+    return get_call_state().demo
+
+
+def active_call_count() -> int:
+    with _lock:
+        return len(_calls) - (1 if DEFAULT_CALL_ID in _calls else 0)
 
 
 def reset_call_state() -> CallState:
-    """Start a fresh call. Demo toggles reset too, so each scenario is clean."""
+    """Fresh state for the current call, and a fresh practice calendar.
 
-    global _state, _toggles
+    For single-call use (tests, probes, the default call). Multi-call clients
+    start a new call instead, which leaves other calls untouched.
+    """
+
+    call_id = _current_call.get()
+    reset_calendar()
     with _lock:
-        _state = CallState()
-        _toggles = DemoToggles()
-        return _state
+        call = CallState(call_id=call_id)
+        _calls[call_id] = call
+        return call
+
+
+def clear_all_calls() -> None:
+    """Drop every call and rebuild the calendar (the DELETE /chat/history reset)."""
+
+    reset_calendar()
+    with _lock:
+        _calls.clear()
+        _calls[DEFAULT_CALL_ID] = CallState()
