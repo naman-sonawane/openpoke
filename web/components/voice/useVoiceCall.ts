@@ -127,7 +127,9 @@ export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
     const w = window as any;
     const Recognition = w.SpeechRecognition || w.webkitSpeechRecognition;
     const recognition = new Recognition();
-    recognition.continuous = true;
+    // Chrome on Android repeats earlier words in continuous mode; take one
+    // phrase per session there and let onend restart it.
+    recognition.continuous = !/Android/i.test(navigator.userAgent);
     recognition.interimResults = true;
     recognition.lang = 'en-US';
 
@@ -184,6 +186,11 @@ export function useVoiceCall({ onTurn }: UseVoiceCallOptions) {
 
   const start = useCallback(() => {
     if (!supported || activeRef.current) return;
+    // Mobile browsers only allow speech that starts from a tap. Speak a silent
+    // utterance inside this click so later replies are allowed to play.
+    const unlock = new SpeechSynthesisUtterance(' ');
+    unlock.volume = 0;
+    window.speechSynthesis.speak(unlock);
     activeRef.current = true;
     setActive(true);
     setStatus('listening');

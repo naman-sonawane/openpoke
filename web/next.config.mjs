@@ -11,6 +11,10 @@ const { loadEnvConfig } = envPackage;
 loadEnvConfig?.(repoRoot, isDevelopment);
 
 /** @type {import('next').NextConfig} */
-const nextConfig = {};
+const nextConfig = {
+  // Middleware runs in the edge runtime, which only sees env passed through
+  // here. Referenced only by middleware.ts, so it never reaches the browser.
+  env: { DEMO_PASSWORD: process.env.DEMO_PASSWORD || '' },
+};
 
 export default nextConfig;
