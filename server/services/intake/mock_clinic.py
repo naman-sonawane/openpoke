@@ -26,7 +26,9 @@ PATIENTS: List[Dict[str, str]] = [
 
 PROVIDERS = ("Dr. Alvarez", "Dr. Kim", "Nurse Practitioner Brooks")
 
-_SLOT_TIMES = [time(h, m) for h in range(8, 17) for m in (0, 30)]
+# 8am to 7:30pm: the practice runs evening hours, which also keeps the
+# same-day path bookable late in the day.
+_SLOT_TIMES = [time(h, m) for h in range(8, 20) for m in (0, 30)]
 
 
 #: How long a slot stays reserved for a caller between read-back and "yes".
