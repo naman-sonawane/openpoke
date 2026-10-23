@@ -7,6 +7,7 @@ export interface IntakeState {
   intake: Record<string, any>;
   priority: { level: string; window: string; reasons: string[]; needs_nurse_review: boolean } | null;
   cleared_safety_checks: string[];
+  denied_by_caller: string[];
   pending_safety_check: string | null;
   booking: Record<string, any> | null;
   emergency: { label: string; category: string; source: string } | null;
@@ -120,11 +121,14 @@ export function StaffPanel({ state, lastLatencyMs, onToggleDemo }: StaffPanelPro
         )}
       </Section>
 
-      {(state.pending_safety_check || state.cleared_safety_checks.length > 0) && (
+      {(state.pending_safety_check || state.cleared_safety_checks.length > 0 || state.denied_by_caller?.length > 0) && (
         <Section title="Safety checks">
-          {state.pending_safety_check && <Row label="Asking">{state.pending_safety_check.replace('_', ' ')}</Row>}
+          {state.pending_safety_check && <Row label="Asking">{state.pending_safety_check}</Row>}
           {state.cleared_safety_checks.length > 0 && (
-            <Row label="Ruled out">{state.cleared_safety_checks.map((c) => c.replace('_', ' ')).join(', ')}</Row>
+            <Row label="Asked, no">{state.cleared_safety_checks.map((c) => c.replace('_', ' ')).join(', ')}</Row>
+          )}
+          {state.denied_by_caller?.length > 0 && (
+            <Row label="Denied">{state.denied_by_caller.map((c) => c.replace('_', ' ')).join(', ')}</Row>
           )}
         </Section>
       )}

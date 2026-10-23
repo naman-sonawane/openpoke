@@ -47,8 +47,15 @@ The stage is derived from call state (`server/services/intake/state.py`), not de
 
 ## Safety logic
 
-- **The screen runs in code, before the model, on every turn, including mid-booking.** A clear phrase ("I can't breathe", "crushing chest pain") skips the model entirely. The caller hears a fixed 911 script, the call moves to `emergency`, and the booking tools disappear from the model's tool list. Booking is also refused server-side.
-- **Negated or ambiguous mentions get exactly one yes/no question.** This covers "no chest pain", "my chest feels tight" and "my dad had a stroke last year". Negation is scoped to the clause, so "no fever but chest pain" is still an emergency. Hedged answers ("maybe", "a little", "not sure") count as yes. An answer that is neither yes nor no hands off to the nurse line rather than asking again.
+The screen runs on every caller turn, before the conversation model and including mid-booking. It has two layers:
+
+1. **Keyword patterns, in code** (`red_flags.py`). A phrase that is an emergency in any context ("crushing chest pain", "can't breathe", "face is drooping") goes straight to a fixed 911 script, with no model call. The call moves to `emergency`, booking tools disappear from the model's tool list, and booking is refused server-side. Anything that *might* be a warning sign is passed to layer 2. That covers negated mentions ("no chest pain"), past or referential ones ("heart attack meds", "had chest pain yesterday"), and hedged or ambiguous ones ("chest feels kind of tight"). Negation is scoped to the clause, so "no fever but chest pain" is still a 911.
+2. **A triage model call** (`triage.py`). It's a separate, narrow call with no tools, so the booking conversation can't distract it. It reads the recent conversation and returns `emergency`, `denied` or `ask`:
+   - `denied` means no question. "I don't think I have any chest pain" is noted and the call carries on; asking about something the caller just ruled out would sound like a keyword bot.
+   - `ask` means one natural yes/no question written for the context ("Is your heart racing right now?"). The caller's answer is judged by the same triage call: any doubt counts as yes, "sorry, what?" gets the question once more, and two misses go to the nurse line.
+
+Code keeps control throughout. The model's verdict maps to fixed actions, and code can only overrule the model towards safety: an answer containing "yeah" or "maybe" is a yes even if the model was unsure. A timeout (5s), invalid JSON, or a question that isn't a single clean question all fall back to the canned behaviour, so a model failure makes the call clunkier, never less safe.
+
 - **Self-harm language** gives 988 and 911 and hands off to a person immediately.
 - **The model is the second layer.** It has `flag_emergency` for things the keyword list misses ("he's turning grey and sweating").
 - **No clinical claims.** The prompt forbids diagnosis, treatment advice and reassurance. Clinical questions go to the nurse line.
@@ -80,6 +87,8 @@ The availability window follows the level. A same-day need with no same-day slot
 ## Results
 
 **Unit tests.** `pytest tests/test_d_intake.py` runs 36 deterministic tests with no network. They cover the red-flag screen (definite, negated, historical, clause-scoped negation), the yes/no classifier, gate behaviour, the priority rules, booking guards, slot conflicts, tool failure, and the absence of booking tools after an emergency.
+
+**Safety gate probe.** `python experiments/triage_probe.py` sends 48 awkward caller messages and answers through the gate against the real model, 3 runs each. The set covers clear emergencies, denials, figures of speech, past events, third-party callers, hedged answers and off-topic answers, and 10 of the cases were written after tuning to check the fixes generalise. Result: **48/48 pass, 0 flaky**. Turns that need a triage call take p50 1.0s and p90 1.3s. Clear emergencies are decided in code without a model call.
 
 **End to end.** `python experiments/intake_scenarios.py` runs 8 scenarios, each with an LLM-played caller, through `/voice/turn` against the real model. Checks run on the structured call state, not on wording. Every scenario also checks for no clinical advice and at most two questions per turn.
 

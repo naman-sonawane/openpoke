@@ -61,7 +61,7 @@ def test_negated_or_ambiguous_phrases_need_confirmation(intake, text, key):
 
 @pytest.mark.parametrize(
     "text",
-    ["I need a refill on my blood pressure meds", "sore throat for three days", "I'm confused about my bill"],
+    ["I need a refill on my blood pressure meds", "sore throat for three days", "I have a question about my bill"],
 )
 def test_routine_requests_raise_nothing(intake, text):
     assert intake["red_flags"].screen(text) == []
@@ -76,47 +76,140 @@ def test_confirmation_classifier_treats_doubt_as_yes(intake, answer, expected):
     assert intake["red_flags"].classify_confirmation(answer) == expected
 
 
+@pytest.mark.parametrize(
+    "text, key",
+    [
+        ("I need a refill on my heart attack meds", "chest_pain"),
+        ("I had chest pain yesterday but it's gone now", "chest_pain"),
+        ("my stroke follow-up appointment", "stroke"),
+    ],
+)
+def test_referential_or_past_mentions_are_not_definite(intake, text, key):
+    assert (key, "possible") in _levels(intake["red_flags"], text)
+
+
 # --- gate ------------------------------------------------------------------
+#
+# The triage model is replaced by a scripted fake: these tests pin down what
+# code does with each verdict, independent of how the model behaves.
 
 
-def test_definite_red_flag_goes_straight_to_911(intake):
-    decision = intake["service"].pre_screen("I'm having crushing chest pain right now")
+@pytest.fixture
+def fake_triage(intake):
+    triage = importlib.import_module("server.services.intake.triage")
+    calls = {"mention": [], "answer": []}
+    script = {"mention": [], "answer": []}
+    originals = (triage.judge_mention, triage.judge_answer)
+
+    async def judge_mention(flags, caller_text, context):
+        calls["mention"].append(caller_text)
+        return script["mention"].pop(0)
+
+    async def judge_answer(flags, question, caller_text, context):
+        calls["answer"].append((question, caller_text))
+        return script["answer"].pop(0)
+
+    triage.judge_mention, triage.judge_answer = judge_mention, judge_answer
+    yield triage, script, calls
+    triage.judge_mention, triage.judge_answer = originals
+
+
+async def test_definite_red_flag_goes_straight_to_911_without_the_model(intake, fake_triage):
+    _, _, calls = fake_triage
+    decision = await intake["service"].pre_screen("I'm having crushing chest pain right now")
     assert "911" in decision.reply
     assert intake["state"].get_call_state().stage == "emergency"
+    assert calls == {"mention": [], "answer": []}
 
 
-def test_negated_flag_asks_once_then_continues_on_no(intake):
+async def test_plain_denial_is_not_questioned(intake, fake_triage):
+    triage, script, _ = fake_triage
+    script["mention"].append(triage.TriageResult("denied", reason="explicit no"))
+    decision = await intake["service"].pre_screen("I don't think I have any chest pain, just a cough")
+    assert decision.reply is None and "Don't ask about it" in decision.note
+    assert intake["state"].get_call_state().denied_flags == ["chest_pain"]
+
+
+async def test_repeated_denial_skips_triage(intake, fake_triage):
+    triage, script, calls = fake_triage
+    script["mention"].append(triage.TriageResult("denied"))
+    await intake["service"].pre_screen("no chest pain")
+    await intake["service"].pre_screen("like I said, no chest pain")
+    assert len(calls["mention"]) == 1
+
+
+async def test_ask_uses_the_model_question_and_no_clears(intake, fake_triage):
+    triage, script, calls = fake_triage
+    question = "Just so I'm sure, any tightness in your chest right now?"
+    script["mention"].append(triage.TriageResult("ask", question=question))
+    script["answer"].append(triage.TriageResult("denied"))
     service, state = intake["service"], intake["state"]
-    first = service.pre_screen("no chest pain, just a bad cough")
-    assert first.reply and "chest pain" in first.reply.lower()
 
-    second = service.pre_screen("no, nothing like that")
-    assert second.reply is None and "not currently having chest pain" in second.note
-    assert state.get_call_state().stage == "identify"
+    first = await service.pre_screen("my chest feels kind of tight sometimes")
+    assert first.reply == question
 
-    # Mentioning it again in the negative must not re-ask.
-    assert service.pre_screen("like I said no chest pain").reply is None
+    second = await service.pre_screen("no, not right now")
+    assert second.reply is None and "answered no" in second.note
+    assert calls["answer"] == [(question, "no, not right now")]
+    assert state.get_call_state().cleared_flags == ["chest_pain"]
 
 
-def test_yes_to_confirm_question_is_an_emergency(intake):
-    service = intake["service"]
-    service.pre_screen("my chest feels tight")
-    decision = service.pre_screen("yeah kind of")
+async def test_yes_to_safety_question_is_an_emergency(intake, fake_triage):
+    triage, script, _ = fake_triage
+    script["mention"].append(triage.TriageResult("ask", question="Any chest pressure now?"))
+    script["answer"].append(triage.TriageResult("emergency"))
+    await intake["service"].pre_screen("my chest feels tight")
+    decision = await intake["service"].pre_screen("yeah kind of")
     assert "911" in decision.reply
 
 
-def test_unclear_answer_hands_off_to_nurse(intake):
+async def test_repeat_asks_once_more_then_hands_off(intake, fake_triage):
+    triage, script, _ = fake_triage
+    script["mention"].append(triage.TriageResult("ask", question="Any chest pressure now?"))
+    script["answer"] += [triage.TriageResult("repeat"), triage.TriageResult("repeat")]
     service, state = intake["service"], intake["state"]
-    service.pre_screen("my chest feels tight")
-    decision = service.pre_screen("well it comes and goes, mostly at night")
-    assert "nurse" in decision.reply
-    assert state.get_call_state().handoff["queue"] == "nurse line"
+    await service.pre_screen("my chest feels tight")
+
+    again = await service.pre_screen("sorry, what?")
+    assert "Any chest pressure now?" in again.reply
+
+    last = await service.pre_screen("huh?")
+    assert "nurse" in last.reply and state.get_call_state().handoff["queue"] == "nurse line"
 
 
-def test_crisis_gives_988_and_hands_off(intake):
-    decision = intake["service"].pre_screen("I just want to end my life")
+async def test_triage_emergency_on_a_possible_mention(intake, fake_triage):
+    triage, script, _ = fake_triage
+    script["mention"].append(triage.TriageResult("emergency"))
+    decision = await intake["service"].pre_screen("I think I'm having a heart attack")
+    assert "911" in decision.reply
+
+
+async def test_crisis_gives_988_and_hands_off(intake, fake_triage):
+    decision = await intake["service"].pre_screen("I just want to end my life")
     assert "988" in decision.reply
     assert intake["state"].get_call_state().handoff is not None
+
+
+async def test_triage_failure_falls_back_to_canned_question(intake, monkeypatch):
+    triage = importlib.import_module("server.services.intake.triage")
+
+    async def boom(*args, **kwargs):
+        raise TimeoutError("provider timed out")
+
+    monkeypatch.setattr(triage, "_call", boom)
+    decision = await intake["service"].pre_screen("my chest feels tight")
+    assert decision.reply == intake["red_flags"].get_flag("chest_pain").question
+
+
+async def test_bad_model_question_falls_back(intake, monkeypatch):
+    triage = importlib.import_module("server.services.intake.triage")
+
+    async def advice(*args, **kwargs):
+        return '{"verdict": "ask", "question": "That sounds like heartburn, probably nothing."}'
+
+    monkeypatch.setattr(triage, "_call", advice)
+    decision = await intake["service"].pre_screen("my chest feels tight")
+    assert decision.reply == intake["red_flags"].get_flag("chest_pain").question
 
 
 # --- priority --------------------------------------------------------------

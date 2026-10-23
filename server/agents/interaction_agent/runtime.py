@@ -79,7 +79,7 @@ class InteractionAgentRuntime:
             # it answers (911 script, confirm question) the model is skipped.
             safety_note = None
             if self.settings.intake_mode:
-                decision = pre_screen(user_message)
+                decision = await pre_screen(user_message, context=transcript_before[-2000:])
                 if decision.reply:
                     self.conversation_log.record_reply(decision.reply)
                     return InteractionResult(success=True, response=decision.reply)

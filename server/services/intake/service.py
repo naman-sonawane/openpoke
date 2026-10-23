@@ -21,8 +21,9 @@ from .mock_clinic import (
     normalize_dob,
     phone_readback,
 )
+from . import triage
 from .priority import VISIT_TYPES, assess_priority
-from .red_flags import RedFlag, classify_confirmation, get_flag, screen
+from .red_flags import RedFlag, get_flag, screen
 from .state import CallState, get_call_state, get_demo_toggles
 
 ToolOutcome = Tuple[bool, Dict[str, Any]]
@@ -90,7 +91,8 @@ class GateDecision:
 
 
 def _declare_emergency(state: CallState, flag: RedFlag, source: str, evidence: str) -> str:
-    state.pending_check = None
+    state.pending_check = []
+    state.pending_question = None
     state.emergency = {"flag": flag.key, "label": flag.label, "category": flag.category, "source": source}
     state.log("emergency", f"{flag.label} ({source}): \"{evidence}\"")
     if flag.category == "crisis":
@@ -100,8 +102,22 @@ def _declare_emergency(state: CallState, flag: RedFlag, source: str, evidence: s
     return EMERGENCY_SCRIPT
 
 
-def pre_screen(caller_text: str) -> GateDecision:
-    """Run the red-flag screen on a caller turn before the model sees it."""
+def _most_serious(flags: List[RedFlag]) -> RedFlag:
+    return next((flag for flag in flags if flag.category == "crisis"), flags[0])
+
+
+def _labels(flags: List[RedFlag]) -> str:
+    return ", ".join(flag.label for flag in flags)
+
+
+async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
+    """Run the safety screen on a caller turn before the conversation model.
+
+    definite keyword match       -> 911 script, decided in code, no model call
+    answer to a pending question -> triage model classifies it; code acts on it
+    possible keyword match       -> triage model: emergency / denied / ask
+    nothing                      -> conversation model handles the turn
+    """
 
     state = get_call_state()
     if state.stage in ("emergency", "handoff"):
@@ -113,43 +129,67 @@ def pre_screen(caller_text: str) -> GateDecision:
     if definite:
         return GateDecision(reply=_declare_emergency(state, definite.flag, "screen", definite.matched))
 
-    note: Optional[str] = None
-    acknowledgement = ""
+    notes: List[str] = []
+    just_cleared: List[str] = []
+
     if state.pending_check:
-        flag = get_flag(state.pending_check)
-        answer = classify_confirmation(caller_text)
-        state.log("safety_check", f"{flag.label}: caller answered '{caller_text}' -> {answer}")
-        if answer == "yes":
-            return GateDecision(reply=_declare_emergency(state, flag, "confirmed", caller_text))
-        if answer == "unclear":
-            state.pending_check = None
+        flags = [get_flag(key) for key in state.pending_check]
+        result = await triage.judge_answer(flags, state.pending_question or "", caller_text, context)
+        state.log("safety_check", f"answer \"{caller_text}\" -> {result.verdict} ({result.source}: {result.reason})")
+        if result.verdict == "emergency":
+            return GateDecision(reply=_declare_emergency(state, _most_serious(flags), "confirmed", caller_text))
+        if result.verdict in ("repeat", "unclear") and state.pending_repeats == 0:
+            # One more try before a nurse: they may not have heard, or may have
+            # answered a different question.
+            state.pending_repeats = 1
+            lead = "Sorry, let me ask again." if result.verdict == "repeat" else "We'll get to that. First, just to check:"
+            return GateDecision(reply=f"{lead} {state.pending_question}")
+        if result.verdict in ("unclear", "repeat"):
+            state.pending_check, state.pending_question = [], None
             _create_handoff(
                 state,
                 "uncertain",
-                f"Unclear answer when asked about {flag.label}: \"{caller_text}\"",
+                f"Unclear answer when asked about {_labels(flags)}: \"{caller_text}\"",
                 queue="nurse line",
             )
             return GateDecision(reply=UNCLEAR_CHECK_SCRIPT)
-        state.pending_check = None
-        state.cleared_flags.append(flag.key)
-        acknowledgement = "Okay, thank you. "
-        note = (
-            f"The caller just confirmed they are not currently having {flag.label}. "
-            "Do not ask about it again. Briefly continue the intake from where it was."
+        just_cleared = list(state.pending_check)
+        state.cleared_flags.extend(key for key in just_cleared if key not in state.cleared_flags)
+        state.pending_check, state.pending_question = [], None
+        notes.append(
+            f"The caller just answered no to the safety question about {_labels(flags)}. "
+            "Acknowledge briefly and carry on with the intake. Don't ask about it again."
         )
 
-    possible = next(
-        (hit for hit in hits if hit.level == "possible" and hit.flag.key not in state.cleared_flags),
-        None,
-    )
+    # A negated mention of something already ruled out ("like I said, no chest
+    # pain") needs no second look. An affirmative mention always does.
+    ruled_out = set(state.cleared_flags) | set(state.denied_flags) | set(just_cleared)
+    possible = [
+        hit
+        for hit in hits
+        if hit.level == "possible"
+        and not (hit.flag.key in ruled_out and hit.downgraded_because == "negated")
+        and hit.flag.key not in just_cleared
+    ]
     if possible:
-        state.pending_check = possible.flag.key
-        why = f" ({possible.downgraded_because})" if possible.downgraded_because else ""
-        state.log("safety_check", f"asked about {possible.flag.label}: matched \"{possible.matched}\"{why}")
-        prefix = acknowledgement or "Before we go on, I want to check one thing. "
-        return GateDecision(reply=prefix + possible.flag.question)
+        flags = [hit.flag for hit in possible]
+        result = await triage.judge_mention(flags, caller_text, context)
+        matched = ", ".join(f"\"{hit.matched}\"" for hit in possible)
+        state.log("safety_check", f"{matched} -> {result.verdict} ({result.source}: {result.reason})")
+        if result.verdict == "emergency":
+            return GateDecision(reply=_declare_emergency(state, _most_serious(flags), "triage", caller_text))
+        if result.verdict == "ask":
+            state.pending_check = [flag.key for flag in flags]
+            state.pending_question = result.question
+            state.pending_repeats = 0
+            return GateDecision(reply=result.question)
+        state.denied_flags.extend(flag.key for flag in flags if flag.key not in state.denied_flags)
+        notes.append(
+            f"The caller mentioned {_labels(flags)} but isn't describing it as a current symptom. "
+            "Don't ask about it; just continue the intake naturally."
+        )
 
-    return GateDecision(note=note)
+    return GateDecision(note=" ".join(notes) or None)
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +540,7 @@ def flag_emergency(description: str) -> ToolOutcome:
 
     state = get_call_state()
     state.emergency = {"flag": "model", "label": description, "category": "medical", "source": "model"}
-    state.pending_check = None
+    state.pending_check, state.pending_question = [], None
     state.log("emergency", f"model flagged: {description}")
     state.log("escalation", "911 advised; clinical team alerted")
     return True, {

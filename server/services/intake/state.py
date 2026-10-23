@@ -38,8 +38,15 @@ class CallState:
     booking: Optional[Dict[str, Any]] = None
     emergency: Optional[Dict[str, Any]] = None
     handoff: Optional[Dict[str, Any]] = None
-    pending_check: Optional[str] = None
+    # Safety question in flight: which flags it covers and the exact wording,
+    # so the caller's answer is judged against what they were actually asked.
+    pending_check: List[str] = field(default_factory=list)
+    pending_question: Optional[str] = None
+    pending_repeats: int = 0
+    # Asked about and answered no: never re-asked, nudges priority up.
     cleared_flags: List[str] = field(default_factory=list)
+    # Caller ruled it out unprompted ("no chest pain"): never asked about.
+    denied_flags: List[str] = field(default_factory=list)
     tool_failures: int = 0
     events: List[Dict[str, str]] = field(default_factory=list)
     calendar: Dict[str, Slot] = field(default_factory=build_calendar)
@@ -82,6 +89,7 @@ class CallState:
             "intake": {k: v for k, v in self.intake.items() if k != "callback_number"},
             "priority": self.priority,
             "cleared_safety_checks": self.cleared_flags,
+            "denied_by_caller": self.denied_flags,
             "offered_slots": [
                 self.calendar[slot_id].as_option(now.date())
                 for slot_id in self.offered_slot_ids
@@ -108,7 +116,7 @@ class CallState:
     def staff_view(self) -> Dict[str, Any]:
         view = self.prompt_view()
         view["events"] = self.events
-        view["pending_safety_check"] = self.pending_check
+        view["pending_safety_check"] = self.pending_question
         view["demo"] = _toggles.as_dict()
         return view
 

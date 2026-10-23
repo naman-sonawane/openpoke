@@ -1,20 +1,20 @@
-"""Deterministic emergency screen that runs on every caller turn before the LLM.
+"""Keyword screen that runs on every caller turn before the conversation model.
 
-The screen is deliberately keyword based. It is explainable, it costs no
-latency, and it cannot be talked out of a decision the way a prompt can. The
-model gets a second look afterwards (the flag_emergency tool), so this layer
-only has to be conservative, not complete.
+Two pattern sets per red flag:
 
-Each red flag has two pattern sets:
+* definite - phrasing that is an emergency in any context ("I can't breathe",
+  "crushing chest pain"). With no negation or context marker nearby, this goes
+  straight to the 911 script in code, with no model call. Fast, deterministic,
+  and impossible to talk the system out of.
+* possible - anything that might be an emergency depending on context:
+  hedged or ambiguous symptoms ("chest feels tight"), referential nouns
+  ("my stroke follow-up"), negations ("no chest pain"). These go to the
+  triage model (triage.py), which reads the conversation and decides whether
+  it's an emergency, a denial, or worth one natural follow-up question.
 
-* definite - unambiguous phrasing ("I can't breathe"). Unless it is negated or
-  clearly about the past, this goes straight to the 911 script.
-* possible - phrasing that may or may not be an emergency ("chest tightness").
-  The caller gets exactly one yes/no question before anything else happens.
-
-A definite phrase that is negated ("no chest pain") or historical ("my dad had
-a stroke last year") is downgraded to possible, so it also gets the one
-confirm question rather than being silently ignored.
+A definite match that is negated or has a context marker in its clause (past
+tense, a relative, medication, a worry) is downgraded to possible, so it is
+judged in context rather than either ignored or escalated blindly.
 """
 
 from __future__ import annotations
@@ -41,17 +41,19 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         category="crisis",
         definite=(
             r"kill(ing)? (myself|himself|herself|themselves)",
-            r"suicid\w*",
             r"end (my|his|her|their) life",
             r"want(s)? to die",
             r"don'?t want to (live|be alive)",
             r"better off dead",
         ),
         possible=(
+            r"suicid\w*",
             r"hurt(ing)? (myself|himself|herself|themselves)",
             r"self[- ]?harm\w*",
             r"no reason to live",
             r"can'?t go on",
+            r"dark thoughts",
+            r"don'?t want to be here anymore",
         ),
         question="I want to make sure you're safe. Are you having thoughts of hurting yourself right now?",
     ),
@@ -62,13 +64,14 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         definite=(
             r"chest (pain|pains|hurts?|is hurting)",
             r"pain in (my|his|her|their|the) chest",
-            r"heart attack",
             r"crushing (pain|pressure)",
         ),
         possible=(
-            r"chest (tight\w*|pressure|discomfort|heaviness|feels? (tight|heavy|weird|funny))",
-            r"tight(ness)? in (my|his|her|their|the) chest",
-            r"heart (is )?(racing|pounding)",
+            r"heart attack",
+            # Proximity rather than exact phrasing: "chest feels kind of tight".
+            r"\bchest\b(\W+\w+){0,4}?\W+(tight\w*|pressure|discomfort|heav\w+|hurt\w*|ache|aching|pain\w*|weird|funny|burn\w*)",
+            r"(tight\w*|pressure|discomfort|heaviness|ache|aching|pain) in (my|his|her|their|the) chest",
+            r"\bheart\b(\W+\w+){0,3}?\W+(racing|pounding|skipping|fluttering|beating (really )?fast)",
             r"palpitations?",
         ),
         question="Are you having chest pain or pressure right now?",
@@ -87,9 +90,12 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         ),
         possible=(
             r"short(ness)? of breath",
-            r"hard to breathe",
-            r"(trouble|difficulty|problems?) breathing",
-            r"breathing (is )?(hard|difficult|trouble)",
+            r"out of breath",
+            r"(hard|harder|difficult) to breathe",
+            r"(trouble|difficulty|problems?|struggl\w*) (with )?breathing",
+            r"breathing\b(\W+\w+){0,3}?\W+(hard|difficult|weird|off|labou?red)",
+            r"catch(ing)? (my|his|her|their) breath",
+            r"\b(lips?|face|skin|fingers?)\b(\W+\w+){0,3}?\W+(blue|grey|gray|purple)\b",
             r"wheez\w*",
         ),
         question="Are you having trouble breathing right now?",
@@ -99,7 +105,6 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         label="stroke symptoms",
         category="medical",
         definite=(
-            r"\bstroke\b",
             r"face (is )?droop\w*",
             r"droop\w* (face|smile|on one side)",
             r"slurr\w*",
@@ -107,11 +112,12 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
             r"one side of (my|his|her|their) (body|face)",
         ),
         possible=(
+            r"\bstroke\b",
             r"sudden(ly)? (numb\w*|tingl\w*)",
             r"numb\w* (in|on) (my|his|her|their) (face|arm|leg|one side)",
             r"(face|arm|leg) (is |went |feels? )?numb",
-            r"sudden(ly)? confus\w*",
-            r"\b(is|are|seems?|got|getting) (really |very |suddenly )?confused",
+            r"\bconfus\w*",
+            r"(can'?t|cannot|unable to|won'?t) (lift|move|raise|feel|grip|use) (my|his|her|their) (arm|leg|hand|face)",
             r"trouble (speaking|talking)",
             r"(sudden(ly)?|lost) (my )?(vision|sight)",
             r"\bweak(ness)? on one side",
@@ -127,11 +133,12 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
             r"unresponsive",
             r"won'?t wake up",
             r"not waking up",
-            r"seizure",
+            r"having a seizure",
             r"seizing",
             r"convuls\w*",
         ),
         possible=(
+            r"seizure",
             r"passed out",
             r"fainted",
             r"fainting",
@@ -159,12 +166,15 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         label="a severe allergic reaction",
         category="medical",
         definite=(
-            r"anaphyla\w*",
             r"throat (is )?(closing|swelling|swollen|tight)",
             r"(tongue|lips?) (is |are )?(swelling|swollen)",
             r"used (my|his|her|their|an) epi-?pen",
         ),
         possible=(
+            r"anaphyla\w*",
+            r"epi-?pen",
+            r"\b(throat|tongue|lips?)\b(\W+\w+){0,3}?\W+(tight\w*|clos\w+|swell\w*|swollen|thick)",
+            r"\b(stung|sting|bee|wasp|peanuts?|shellfish)\b.*\b(swell\w*|tight\w*|breath\w*|throat)\b",
             r"allergic reaction",
             r"\bhives\b",
             r"face (is )?(swelling|swollen)",
@@ -176,11 +186,12 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         label="a possible overdose or poisoning",
         category="medical",
         definite=(
-            r"overdos\w*",
+            r"overdos(ed|ing)",
             r"took too many pills",
-            r"poison(ed|ing)",
         ),
         possible=(
+            r"overdose",
+            r"poison\w*",
             r"took too (much|many)",
             r"swallowed (something|a|some)",
         ),
@@ -210,12 +221,17 @@ _NEGATION_RE = re.compile(
     r"wasn'?t|haven'?t|hasn'?t|none|nor|neither|free of)\b"
 )
 
-# Markers that a mention is historical, hypothetical, or a worry rather than a
-# current symptom. These downgrade a definite match to a confirm question.
+# Context markers: the mention may be historical, hypothetical, referential
+# (a medication, an appointment) or a worry rather than a current symptom.
+# These downgrade a definite match so the triage model judges it in context.
+# Over-matching here is cheap: it costs one model call, never a missed case,
+# because the triage model can still declare an emergency.
 _NOT_CURRENT_RE = re.compile(
-    r"\b(last (year|month|week|summer|winter|spring|fall)|years? ago|months? ago|"
-    r"used to|history of|in the past|had a|what if|in case|worried about|"
-    r"scared of|afraid of|risk of|my (dad|mom|father|mother|grand\w+) had)\b"
+    r"\b(had|has had|have had|was|were|yesterday|last \w+|\w+ ago|earlier|used to|"
+    r"history|in the past|before|went away|gone|resolved|anymore|better now|"
+    r"what if|in case|worried|worry|scared|afraid|risk|sign of|symptom of|normal|"
+    r"medication|meds|pills|prescription|refill|follow[- ]?up|appointment|bill|"
+    r"insurance|test results?|(dad|mom|father|mother|grand\w+|brother|sister|uncle|aunt)'?s?)\b"
 )
 
 # Clause boundaries. "no fever but chest pain" must not negate the chest pain.
