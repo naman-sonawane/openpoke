@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ..config import get_settings
+from . import anthropic_direct
 
 OpenRouterBaseURL = "https://openrouter.ai/api/v1"
 
@@ -63,7 +64,25 @@ async def request_chat_completion(
     provider: Optional[Dict[str, Any]] = None,
     max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Request a chat completion and return the raw JSON payload."""
+    """Request a chat completion and return the raw JSON payload.
+
+    With ANTHROPIC_API_KEY set, supported Claude models go straight to the
+    Anthropic API (same request and response shape for callers); everything
+    else goes through OpenRouter. `provider` routing only applies to
+    OpenRouter.
+    """
+
+    settings = get_settings()
+    if settings.anthropic_api_key and anthropic_direct.supports(model):
+        return await anthropic_direct.complete(
+            api_key=settings.anthropic_api_key,
+            model=model,
+            messages=messages,
+            system=system,
+            tools=tools,
+            max_tokens=max_tokens,
+            error_type=OpenRouterError,
+        )
 
     payload: Dict[str, object] = {
         "model": model,

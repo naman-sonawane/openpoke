@@ -368,22 +368,22 @@ CALLER_SYSTEM = (
 
 
 async def caller_reply(client: httpx.AsyncClient, persona: str, transcript: List[Dict[str, str]]) -> str:
+    # Same client as the server, so the simulated caller uses whichever
+    # provider is configured (direct Anthropic when ANTHROPIC_API_KEY is set).
+    from server.openrouter_client import request_chat_completion
+
     messages = [
         {"role": "assistant" if turn["role"] == "caller" else "user", "content": turn["text"]}
         for turn in transcript
     ]
-    response = await client.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {get_settings().openrouter_api_key}"},
-        json={
-            "model": CALLER_MODEL,
-            "messages": [{"role": "system", "content": CALLER_SYSTEM.format(persona=persona)}, *messages],
-            "max_tokens": 120,
-        },
-        timeout=60,
+    response = await request_chat_completion(
+        model=CALLER_MODEL,
+        system=CALLER_SYSTEM.format(persona=persona),
+        messages=messages,
+        api_key=get_settings().openrouter_api_key,
+        max_tokens=120,
     )
-    response.raise_for_status()
-    return (response.json()["choices"][0]["message"]["content"] or "").strip()
+    return (response["choices"][0]["message"]["content"] or "").strip()
 
 
 async def run_scenario(client: httpx.AsyncClient, scenario: Scenario) -> Dict[str, Any]:
