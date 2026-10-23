@@ -80,18 +80,29 @@ INTAKE_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             },
         },
     },
+    "hold_slot": {
+        "description": (
+            "Reserve the slot the caller picked, so nobody else can take it while you read it back. "
+            "Returns the exact wording to read back. Call again if they change their mind."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"slot_id": {"type": "string", "description": "A slot_id from check_availability."}},
+            "required": ["slot_id"],
+        },
+    },
     "book_appointment": {
         "description": (
-            "Book a slot. Only call after reading back the day, time and provider and the caller "
-            "saying yes. The callback number must already be confirmed."
+            "Book the held slot. Only call after reading back the held time and the caller saying yes. "
+            "The callback number must already be confirmed."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "slot_id": {"type": "string"},
                 "caller_confirmed": {"type": "boolean"},
+                "slot_id": {"type": "string", "description": "Optional; must be the held slot."},
             },
-            "required": ["slot_id", "caller_confirmed"],
+            "required": ["caller_confirmed"],
         },
     },
     "flag_emergency": {

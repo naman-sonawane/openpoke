@@ -188,6 +188,8 @@ export default function Page() {
 
   const toggleDemo = useCallback(
     async (key: 'fail_next_tool' | 'slot_conflict', value: boolean) => {
+      // Show the change at once; the next poll confirms what the server stored.
+      setIntakeState((prev) => (prev ? { ...prev, demo: { ...prev.demo, [key]: value } } : prev));
       await fetch('/api/intake/demo', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

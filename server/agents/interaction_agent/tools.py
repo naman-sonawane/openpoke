@@ -9,7 +9,7 @@ from ...config import get_settings
 from ...logging_config import logger
 from ...services.conversation import get_conversation_log
 from ...services.execution import get_agent_roster, get_execution_agent_logs
-from ...services.intake import run_tool as run_intake_tool
+from ...services.intake import handoff_on_error, run_tool as run_intake_tool
 from ..execution_agent.batch_manager import ExecutionBatchManager
 from .intake_tools import INTAKE_TOOL_SCHEMAS, get_intake_tool_schemas
 
@@ -243,7 +243,25 @@ def handle_tool_call(name: str, arguments: Any) -> ToolResult:
             return ToolResult(success=False, payload={"error": "Invalid arguments format"})
 
         if get_settings().intake_mode and name in INTAKE_TOOL_SCHEMAS:
-            success, payload = run_intake_tool(name, args)
+            try:
+                success, payload = run_intake_tool(name, args)
+            except TypeError:
+                raise  # bad arguments: reported to the model below so it can retry
+            except Exception as exc:
+                # A crashing tool must never leave the caller stranded or let
+                # the model improvise ("call back later"): hand off in code.
+                logger.error("intake tool crashed", extra={"tool": name, "error": str(exc)})
+                handoff_on_error(f"{name} crashed: {exc}")
+                return ToolResult(
+                    success=False,
+                    payload={
+                        "error": "system_error",
+                        "instruction": (
+                            "The call has been handed to the front desk. Apologise briefly and tell the "
+                            "caller you're connecting them now. Do not ask them to call back."
+                        ),
+                    },
+                )
             return ToolResult(success=success, payload=payload)
 
         if name == "send_message_to_agent":

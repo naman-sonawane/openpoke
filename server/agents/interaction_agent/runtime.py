@@ -1,5 +1,6 @@
 """Interaction Agent Runtime - handles LLM calls for user and agent turns."""
 
+import asyncio
 import json
 import time
 import uuid
@@ -11,7 +12,7 @@ from .tools import ToolResult, get_tool_schemas, handle_tool_call
 from ..execution_agent.batch_manager import reset_turn_id, set_turn_id
 from ...config import get_settings
 from ...services.conversation import get_conversation_log, get_working_memory_log
-from ...services.intake import get_call_state, handoff_on_error, pre_screen
+from ...services.intake import background_screen, get_call_state, handoff_on_error, pre_screen
 from ...openrouter_client import PRIVATE_FAST_ROUTING, request_chat_completion
 from ...logging_config import logger
 
@@ -38,6 +39,14 @@ class _ToolCall:
     arguments: Dict[str, Any]
 
 
+class _SafetyPreempted(Exception):
+    """The always-on screen flagged the turn; its reply replaces the model's."""
+
+    def __init__(self, reply: str):
+        super().__init__(reply)
+        self.reply = reply
+
+
 @dataclass
 class _LoopSummary:
     """Aggregate information produced by the interaction loop."""
@@ -49,6 +58,9 @@ class _LoopSummary:
     llm_calls: int = 0
     llm_ms: List[int] = field(default_factory=list)
     prompt_tokens: List[int] = field(default_factory=list)
+    # Time spent waiting on the always-on screen after the model had answered
+    # (zero when the screen finished first, which is the usual case).
+    screen_wait_ms: int = 0
 
 
 class InteractionAgentRuntime:
@@ -91,6 +103,7 @@ class InteractionAgentRuntime:
             # The safety screen runs before the model on every caller turn. When
             # it answers (911 script, confirm question) the model is skipped.
             safety_note = None
+            safety_task: Optional[asyncio.Task] = None
             gate_ms = 0
             if self.settings.intake_mode:
                 gate_started = time.perf_counter()
@@ -102,6 +115,12 @@ class InteractionAgentRuntime:
                         success=True, response=decision.reply, timings={"gate_ms": gate_ms, "llm_ms": []}
                     )
                 safety_note = decision.note
+                if decision.needs_background_screen:
+                    # No keyword matched: run the model screen alongside the
+                    # conversation model instead of in front of it.
+                    safety_task = asyncio.create_task(
+                        background_screen(user_message, context=transcript_before[-2000:])
+                    )
 
             system_prompt = build_system_prompt()
             messages = prepare_message_with_history(
@@ -109,7 +128,13 @@ class InteractionAgentRuntime:
             )
 
             logger.info("Processing user message through interaction agent")
-            summary = await self._run_interaction_loop(system_prompt, messages)
+            try:
+                summary = await self._run_interaction_loop(system_prompt, messages, safety_task)
+            except _SafetyPreempted as preempted:
+                self.conversation_log.record_reply(preempted.reply)
+                return InteractionResult(
+                    success=True, response=preempted.reply, timings={"gate_ms": gate_ms, "llm_ms": []}
+                )
 
             final_response = self._finalize_response(summary)
             if not final_response and self.settings.intake_mode:
@@ -127,6 +152,7 @@ class InteractionAgentRuntime:
                     "gate_ms": gate_ms,
                     "llm_ms": summary.llm_ms,
                     "prompt_tokens": summary.prompt_tokens,
+                    "screen_wait_ms": summary.screen_wait_ms,
                 },
             )
 
@@ -143,6 +169,8 @@ class InteractionAgentRuntime:
                 error=str(exc),
             )
         finally:
+            if safety_task is not None and not safety_task.done():
+                safety_task.cancel()
             reset_turn_id(token)
 
     # Handle incoming messages from execution agents and generate appropriate responses
@@ -188,8 +216,14 @@ class InteractionAgentRuntime:
         self,
         system_prompt: str,
         messages: List[Dict[str, Any]],
+        safety_task: Optional[asyncio.Task] = None,
     ) -> _LoopSummary:
-        """Iteratively query the LLM until it issues a final response."""
+        """Iteratively query the LLM until it issues a final response.
+
+        safety_task, when given, is the always-on screen running in parallel.
+        It is awaited after the first model response and before any tool runs
+        or any text is used, so a flagged turn has no side effects.
+        """
 
         summary = _LoopSummary()
 
@@ -199,6 +233,14 @@ class InteractionAgentRuntime:
             summary.llm_calls += 1
             summary.llm_ms.append(round((time.perf_counter() - call_started) * 1000))
             summary.prompt_tokens.append((response.get("usage") or {}).get("prompt_tokens") or 0)
+
+            if safety_task is not None:
+                wait_started = time.perf_counter()
+                verdict = await safety_task
+                summary.screen_wait_ms = round((time.perf_counter() - wait_started) * 1000)
+                safety_task = None
+                if verdict.reply:
+                    raise _SafetyPreempted(verdict.reply)
             assistant_message = self._extract_assistant_message(response)
 
             assistant_content = (assistant_message.get("content") or "").strip()

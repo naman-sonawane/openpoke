@@ -47,19 +47,25 @@ The stage is derived from call state (`server/services/intake/state.py`), not de
 
 ## Safety logic
 
-The screen runs on every caller turn, before the conversation model and including mid-booking. It has two layers:
+Every caller turn is screened, including mid-booking. There are two layers, and the patterns are **not** the safety net:
 
-1. **Keyword patterns, in code** (`red_flags.py`). A phrase that is an emergency in any context ("crushing chest pain", "can't breathe", "face is drooping") goes straight to a fixed 911 script, with no model call. The call moves to `emergency`, booking tools disappear from the model's tool list, and booking is refused server-side. Anything that *might* be a warning sign is passed to layer 2. That covers negated mentions ("no chest pain"), past or referential ones ("heart attack meds", "had chest pain yesterday"), and hedged or ambiguous ones ("chest feels kind of tight"). Negation is scoped to the clause, so "no fever but chest pain" is still a 911.
-2. **A triage model call** (`triage.py`). It's a separate, narrow call with no tools, so the booking conversation can't distract it. It reads the recent conversation and returns `emergency`, `denied` or `ask`:
+1. **Keyword patterns, in code** (`red_flags.py`). These are the instant path for phrases that are an emergency in any context ("crushing chest pain", "can't breathe", "face is drooping"). They go straight to a fixed 911 script, with no model call. The call moves to `emergency`, booking tools disappear from the model's tool list, and booking is refused server-side. Softer matches (negated, past, referential, hedged) are passed to layer 2 as hints. Negation is scoped to the clause, so "no fever but chest pain" is still a 911.
+2. **An always-on model screen** (`triage.py`). It runs on **every** turn, not just when a pattern matched. It's a separate, narrow call with no tools, judging by meaning against a checklist of categories: chest pain, breathing, stroke signs and the like, plus high-risk groups (fever in a baby under 3 months, pregnancy warning signs, a floppy child, sudden confusion in an older adult) and self-harm. So "my newborn feels really hot" or "his smile looks crooked" is caught with no pattern for it. It returns `emergency`, `ask`, `denied` or `none`:
    - `denied` means no question. "I don't think I have any chest pain" is noted and the call carries on; asking about something the caller just ruled out would sound like a keyword bot.
-   - `ask` means one natural yes/no question written for the context ("Is your heart racing right now?"). The caller's answer is judged by the same triage call: any doubt counts as yes, "sorry, what?" gets the question once more, and two misses go to the nurse line.
+   - `ask` means one natural yes/no question written for the context ("Is your heart racing right now?"). The caller's answer is judged by the same screen: doubt about right now counts as yes, "sorry, what?" gets the question once more, and two misses go to the nurse line.
+
+   **How it stays fast:** when no pattern matched, the screen runs alongside the conversation model rather than in front of it. The runtime waits for its verdict after the model's first response and before any tool runs or any reply is spoken, so a flagged turn has no side effects and the screen adds almost no latency. When a pattern did match, the screen runs first, so a denial can be passed to the conversation model.
 
 Code keeps control throughout. The model's verdict maps to fixed actions, and code can only overrule the model towards safety: an answer containing "yeah" or "maybe" is a yes even if the model was unsure. A timeout (5s), invalid JSON, or a question that isn't a single clean question all fall back to the canned behaviour, so a model failure makes the call clunkier, never less safe.
 
 - **Self-harm language** gives 988 and 911 and hands off to a person immediately.
 - **The model is the second layer.** It has `flag_emergency` for things the keyword list misses ("he's turning grey and sweating").
 - **No clinical claims.** The prompt forbids diagnosis, treatment advice and reassurance. Clinical questions go to the nurse line.
-- **Confirmation is enforced, not just prompted.** `book_appointment` refuses unless the caller is identified, a priority exists, the callback number was read back and confirmed, and `caller_confirmed` is true.
+- **Confirmation is enforced, not just prompted.** Booking is hold-then-confirm:
+  - `hold_slot` reserves the caller's choice atomically for this call and returns the exact wording to read back.
+  - `book_appointment` can only book the held slot, and only once the caller is identified, a priority exists, the callback number is confirmed, and the caller has said yes.
+  - The time the caller agreed to is always the time that gets booked, and no concurrent caller can take it during the read-back. (An early run read back Tuesday 10am and booked Wednesday 11am; that is now impossible in code.)
+- **Failures never strand a caller.** A tool that crashes, or a model outage, hands the call to staff in code and says so. The agent is never left to improvise "please call back".
 
 ## Priority
 
@@ -105,11 +111,32 @@ This is a demo on synthetic patients. It does not meet HIPAA requirements as is;
 
 ## Results
 
-**Unit tests.** `pytest` runs 75 tests with no network: 26 for the agent-scaling work and 49 for intake. The intake tests cover:
+**Acceptance testing.** `python experiments/acceptance.py` runs all four layers below and prints one summary; `--offline` runs only the unit tests. The live layers need both servers running and OpenRouter credit.
+
+| Layer | What it checks | Command |
+|---|---|---|
+| unit | rules, guards, concurrency, every safety path with a fake model | `pytest` |
+| safety | awkward caller lines through the real safety screen | `python experiments/triage_probe.py` |
+| calls | whole calls with LLM-played callers, 8 at a time | `python experiments/intake_scenarios.py` |
+| ui | the console in a real browser (Playwright) | `npm run test:e2e --prefix web` |
+
+**Unit tests.** `pytest` runs 87 tests with no network: 26 for the agent-scaling work and 61 for intake. The intake tests cover:
 - the red-flag screen: definite, negated, historical, and negation scoped to the clause;
 - every triage verdict path, using a scripted fake model, plus timeout and bad-output fallbacks;
-- priority rules, booking guards, slot conflicts and tool failure;
+- the always-on screen preempting the model before any tool runs, and adding no latency when quiet;
+- priority rules, hold-then-confirm booking guards, slot conflicts and tool failure;
 - concurrency (`tests/test_e_concurrent_calls.py`).
+
+**UI (Playwright).** Seven browser tests:
+- the greeting discloses AI and transcription;
+- a clear emergency shows the 911 script and the emergency banner;
+- a caller is identified and appears in the staff view;
+- two tabs are separate calls;
+- demo switches persist on the call;
+- typing before a call prompts for a new call;
+- the console is password protected.
+
+All 7 pass.
 
 **Safety gate probe.** `python experiments/triage_probe.py` sends 48 awkward caller messages and answers through the gate against the real model, with 2–3 runs each. The set covers clear emergencies, denials, figures of speech, past events, third-party callers, hedged answers and off-topic answers, and 10 of the cases were written after tuning to check the fixes generalise. Result: **48/48 pass, 0 flaky**. Turns that need a triage call take p50 1.0s and p90 1.3s. Clear emergencies are decided in code without a model call.
 

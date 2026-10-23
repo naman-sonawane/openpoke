@@ -10,6 +10,7 @@ from __future__ import annotations
 import random
 import re
 import threading
+import time as _time
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional
@@ -28,12 +29,26 @@ PROVIDERS = ("Dr. Alvarez", "Dr. Kim", "Nurse Practitioner Brooks")
 _SLOT_TIMES = [time(h, m) for h in range(8, 17) for m in (0, 30)]
 
 
+#: How long a slot stays reserved for a caller between read-back and "yes".
+HOLD_SECONDS = 10 * 60
+
+
 @dataclass
 class Slot:
     id: str
     start: datetime
     provider: str
     booked: bool = False
+    held_by: Optional[str] = None  # call id holding it during read-back
+    held_until: float = 0.0
+
+    def is_open_for(self, call_id: Optional[str] = None) -> bool:
+        """Bookable by this call: not booked, and not held by another live call."""
+        if self.booked:
+            return False
+        if self.held_by is None or self.held_by == call_id:
+            return True
+        return _time.monotonic() > self.held_until
 
     def spoken(self, today: date) -> str:
         day = self.start.date()
@@ -82,10 +97,11 @@ def build_calendar(now: Optional[datetime] = None, seed: int = 7) -> Dict[str, S
             booked = rng.random() < 0.75
             slots[slot_id] = Slot(slot_id, start, provider, booked)
 
-    # Guarantee the same-day path is demoable while the clinic is open: keep
-    # the next two remaining slots today free.
+    # Practices hold back same-day slots for urgent needs. Keep the next six
+    # remaining slots today free so the same-day path works while the clinic
+    # is open, even with several calls booking at once.
     todays = sorted((s for s in slots.values() if s.start.date() == now.date()), key=lambda s: s.start)
-    for slot in todays[:2]:
+    for slot in todays[:6]:
         slot.booked = False
     return slots
 
@@ -101,15 +117,49 @@ def get_calendar() -> Dict[str, Slot]:
     return _calendar
 
 
-def try_book(slot_id: str) -> bool:
-    """Atomically claim a slot. False if it doesn't exist or is already taken."""
+def try_book(slot_id: str, call_id: Optional[str] = None) -> bool:
+    """Atomically claim a slot. False if it doesn't exist, is booked, or is
+    held by another live call."""
 
     with _calendar_lock:
         slot = _calendar.get(slot_id)
-        if slot is None or slot.booked:
+        if slot is None or not slot.is_open_for(call_id):
             return False
-        slot.booked = True
+        slot.booked, slot.held_by = True, None
         return True
+
+
+def try_hold(slot_id: str, call_id: str) -> bool:
+    """Reserve a slot for one call while its time is read back. A call holds
+    at most one slot, so holding a new one releases the previous hold."""
+
+    with _calendar_lock:
+        slot = _calendar.get(slot_id)
+        if slot is None or not slot.is_open_for(call_id):
+            return False
+        for other in _calendar.values():
+            if other.held_by == call_id and other is not slot:
+                other.held_by = None
+        slot.held_by, slot.held_until = call_id, _time.monotonic() + HOLD_SECONDS
+        return True
+
+
+def confirm_hold(slot_id: str, call_id: str) -> bool:
+    """Book the slot this call is holding. False if the hold was lost."""
+
+    with _calendar_lock:
+        slot = _calendar.get(slot_id)
+        if slot is None or slot.booked or not slot.is_open_for(call_id):
+            return False
+        slot.booked, slot.held_by = True, None
+        return True
+
+
+def release_holds(call_id: str) -> None:
+    with _calendar_lock:
+        for slot in _calendar.values():
+            if slot.held_by == call_id:
+                slot.held_by = None
 
 
 def reset_calendar() -> None:

@@ -8,6 +8,7 @@ a priority, and has confirmed the read-back, however the model was prompted.
 
 from __future__ import annotations
 
+import inspect
 import random
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -19,12 +20,15 @@ from .mock_clinic import (
     digits_only,
     find_patient,
     normalize_dob,
+    confirm_hold,
     phone_readback,
+    release_holds,
     try_book,
+    try_hold,
 )
 from . import triage
 from .priority import VISIT_TYPES, assess_priority
-from .red_flags import RedFlag, get_flag, screen
+from .red_flags import RedFlag, flag_label, model_flag_key, screen
 from .state import CallState, get_call_state, get_demo_toggles
 
 ToolOutcome = Tuple[bool, Dict[str, Any]]
@@ -64,6 +68,7 @@ STAGE_TOOLS: Dict[str, Tuple[str, ...]] = {
     "intake": ("record_intake", "assign_priority", "lookup_patient", "flag_emergency", "transfer_to_human"),
     "schedule": (
         "check_availability",
+        "hold_slot",
         "book_appointment",
         "record_intake",
         "assign_priority",
@@ -78,7 +83,7 @@ STAGE_TOOLS: Dict[str, Tuple[str, ...]] = {
 }
 
 # Tools that hit the (mocked) practice system and so can fail.
-_BACKEND_TOOLS = {"lookup_patient", "register_new_patient", "check_availability", "book_appointment"}
+_BACKEND_TOOLS = {"lookup_patient", "register_new_patient", "check_availability", "hold_slot", "book_appointment"}
 
 
 # ---------------------------------------------------------------------------
@@ -89,30 +94,55 @@ _BACKEND_TOOLS = {"lookup_patient", "register_new_patient", "check_availability"
 @dataclass
 class GateDecision:
     """reply set: answer the caller with it and skip the model this turn.
-    note set: pass it to the model alongside the caller's words."""
+    note set: pass it to the model alongside the caller's words.
+    needs_background_screen: no model screen ran yet this turn, so the runtime
+    runs the always-on screen alongside the conversation model."""
 
     reply: Optional[str] = None
     note: Optional[str] = None
+    needs_background_screen: bool = False
 
 
-def _declare_emergency(state: CallState, flag: RedFlag, source: str, evidence: str) -> str:
-    state.pending_check = []
-    state.pending_question = None
-    state.emergency = {"flag": flag.key, "label": flag.label, "category": flag.category, "source": source}
-    state.log("emergency", f"{flag.label} ({source}): \"{evidence}\"")
-    if flag.category == "crisis":
-        _create_handoff(state, "sensitive", f"Caller indicated {flag.label}. 988/911 given.", queue="nurse line")
+def _release_hold(state: CallState) -> None:
+    if state.held_slot_id:
+        release_holds(state.call_id)
+        state.held_slot_id = None
+
+
+def _declare_emergency(state: CallState, key: str, label: str, category: str, source: str, evidence: str) -> str:
+    _release_hold(state)
+    state.pending_check, state.pending_question = [], None
+    state.emergency = {"flag": key, "label": label, "category": category, "source": source}
+    state.log("emergency", f"{label} ({source}): \"{evidence}\"")
+    if category == "crisis":
+        _create_handoff(state, "sensitive", f"Caller indicated {label}. 988/911 given.", queue="nurse line")
         return CRISIS_SCRIPT
     state.log("escalation", "911 advised; clinical team alerted")
     return EMERGENCY_SCRIPT
 
 
-def _most_serious(flags: List[RedFlag]) -> RedFlag:
-    return next((flag for flag in flags if flag.category == "crisis"), flags[0])
-
-
 def _labels(flags: List[RedFlag]) -> str:
     return ", ".join(flag.label for flag in flags)
+
+
+def _act_on_screen(
+    state: CallState, result: "triage.TriageResult", keys: List[str], label: str, caller_text: str
+) -> Optional[str]:
+    """Turn a screen verdict into a fixed action. Returns the reply when the
+    turn is answered here (911 script or the safety question)."""
+
+    if result.verdict == "emergency":
+        return _declare_emergency(state, keys[0], label, result.category, "triage", caller_text)
+    if result.verdict == "ask":
+        state.pending_check = keys
+        state.pending_question = result.question
+        state.pending_labels = label
+        state.pending_category = result.category
+        state.pending_repeats = 0
+        return result.question
+    if result.verdict == "denied":
+        state.denied_flags.extend(key for key in keys if key not in state.denied_flags)
+    return None
 
 
 async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
@@ -120,8 +150,9 @@ async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
 
     definite keyword match       -> 911 script, decided in code, no model call
     answer to a pending question -> triage model classifies it; code acts on it
-    possible keyword match       -> triage model: emergency / denied / ask
-    nothing                      -> conversation model handles the turn
+    possible keyword match       -> triage model screens it, with the match as a hint
+    nothing matched              -> the always-on screen runs alongside the
+                                    conversation model (background_screen)
     """
 
     state = get_call_state()
@@ -132,17 +163,24 @@ async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
 
     definite = next((hit for hit in hits if hit.level == "definite"), None)
     if definite:
-        return GateDecision(reply=_declare_emergency(state, definite.flag, "screen", definite.matched))
+        flag = definite.flag
+        return GateDecision(
+            reply=_declare_emergency(state, flag.key, flag.label, flag.category, "screen", definite.matched)
+        )
 
     notes: List[str] = []
     just_cleared: List[str] = []
 
     if state.pending_check:
-        flags = [get_flag(key) for key in state.pending_check]
-        result = await triage.judge_answer(flags, state.pending_question or "", caller_text, context)
+        labels = state.pending_labels or "a possible warning sign"
+        result = await triage.judge_answer(labels, state.pending_question or "", caller_text, context)
         state.log("safety_check", f"answer \"{caller_text}\" -> {result.verdict} ({result.source}: {result.reason})")
         if result.verdict == "emergency":
-            return GateDecision(reply=_declare_emergency(state, _most_serious(flags), "confirmed", caller_text))
+            return GateDecision(
+                reply=_declare_emergency(
+                    state, state.pending_check[0], labels, state.pending_category, "confirmed", caller_text
+                )
+            )
         if result.verdict in ("repeat", "unclear") and state.pending_repeats == 0:
             # One more try before a nurse: they may not have heard, or may have
             # answered a different question.
@@ -154,7 +192,7 @@ async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
             _create_handoff(
                 state,
                 "uncertain",
-                f"Unclear answer when asked about {_labels(flags)}: \"{caller_text}\"",
+                f"Unclear answer when asked about {labels}: \"{caller_text}\"",
                 queue="nurse line",
             )
             return GateDecision(reply=UNCLEAR_CHECK_SCRIPT)
@@ -162,7 +200,7 @@ async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
         state.cleared_flags.extend(key for key in just_cleared if key not in state.cleared_flags)
         state.pending_check, state.pending_question = [], None
         notes.append(
-            f"The caller just answered no to the safety question about {_labels(flags)}. "
+            f"The caller just answered no to the safety question about {labels}. "
             "Acknowledge briefly and carry on with the intake. Don't ask about it again."
         )
 
@@ -178,23 +216,42 @@ async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
     ]
     if possible:
         flags = [hit.flag for hit in possible]
-        result = await triage.judge_mention(flags, caller_text, context)
+        result = await triage.screen_turn(caller_text, context, hints=flags)
         matched = ", ".join(f"\"{hit.matched}\"" for hit in possible)
         state.log("safety_check", f"{matched} -> {result.verdict} ({result.source}: {result.reason})")
-        if result.verdict == "emergency":
-            return GateDecision(reply=_declare_emergency(state, _most_serious(flags), "triage", caller_text))
-        if result.verdict == "ask":
-            state.pending_check = [flag.key for flag in flags]
-            state.pending_question = result.question
-            state.pending_repeats = 0
-            return GateDecision(reply=result.question)
-        state.denied_flags.extend(flag.key for flag in flags if flag.key not in state.denied_flags)
-        notes.append(
-            f"The caller mentioned {_labels(flags)} but isn't describing it as a current symptom. "
-            "Don't ask about it; just continue the intake naturally."
-        )
+        reply = _act_on_screen(state, result, [flag.key for flag in flags], _labels(flags), caller_text)
+        if reply:
+            return GateDecision(reply=reply)
+        if result.verdict == "denied":
+            notes.append(
+                f"The caller mentioned {_labels(flags)} but isn't describing it as a current symptom. "
+                "Don't ask about it; just continue the intake naturally."
+            )
+        return GateDecision(note=" ".join(notes) or None)
 
-    return GateDecision(note=" ".join(notes) or None)
+    # A turn that answered a safety question has already been judged, with the
+    # question as context; screening it again on its own would re-ask.
+    return GateDecision(note=" ".join(notes) or None, needs_background_screen=not just_cleared)
+
+
+async def background_screen(caller_text: str, context: str = "") -> GateDecision:
+    """The always-on screen for turns no keyword matched.
+
+    Runs concurrently with the conversation model; the runtime waits for it
+    before acting on the model's first response, so nothing (a booking, a
+    reply) happens on a turn this flags. This is what catches emergencies in
+    wording the patterns don't know.
+    """
+
+    state = get_call_state()
+    if state.stage in ("emergency", "handoff"):
+        return GateDecision()
+    result = await triage.screen_turn(caller_text, context)
+    if result.verdict == "none":
+        return GateDecision()
+    label = result.reason or "a possible warning sign"
+    state.log("safety_check", f"always-on screen -> {result.verdict} ({result.source}: {label})")
+    return GateDecision(reply=_act_on_screen(state, result, [model_flag_key(label)], label, caller_text))
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +387,7 @@ def assign_priority(
         onset_days=onset_days,
         worsening=worsening,
         high_risk=high_risk,
-        cleared_red_flags=[get_flag(key).label for key in state.cleared_flags],
+        cleared_red_flags=[flag_label(key) for key in state.cleared_flags],
     )
     state.intake.update(
         {
@@ -400,7 +457,7 @@ def check_availability(preferred_day: Optional[str] = None, time_of_day: Optiona
     wanted_day = _resolve_day(preferred_day, now.date())
 
     open_slots = sorted(
-        (slot for slot in state.calendar.values() if not slot.booked and slot.start > now),
+        (slot for slot in state.calendar.values() if slot.is_open_for(state.call_id) and slot.start > now),
         key=lambda slot: slot.start,
     )
 
@@ -446,9 +503,7 @@ def check_availability(preferred_day: Optional[str] = None, time_of_day: Optiona
         if slot.id not in state.offered_slot_ids:
             state.offered_slot_ids.append(slot.id)
     state.log("availability", f"offered {', '.join(slot.id for slot in options)}")
-    instruction = "Offer at most two of these out loud and ask which works."
-    if not state.intake.get("callback_confirmed"):
-        instruction += " Once they pick one, confirm the callback number before reading the appointment back."
+    instruction = "Offer at most two of these out loud and ask which works. When they pick one, call hold_slot."
     payload: Dict[str, Any] = {
         "priority": level,
         "options": [slot.as_option(now.date()) for slot in options],
@@ -459,12 +514,69 @@ def check_availability(preferred_day: Optional[str] = None, time_of_day: Optiona
     return True, payload
 
 
-def book_appointment(slot_id: str, caller_confirmed: bool) -> ToolOutcome:
-    failure = _maybe_fail("book_appointment")
+def _open_offered(state: CallState) -> List[Dict[str, str]]:
+    today = datetime.now().date()
+    return [
+        state.calendar[sid].as_option(today)
+        for sid in state.offered_slot_ids
+        if sid in state.calendar and state.calendar[sid].is_open_for(state.call_id)
+    ]
+
+
+def hold_slot(slot_id: str) -> ToolOutcome:
+    """Reserve the caller's chosen slot and return the exact words to read back.
+
+    Booking then confirms this hold and nothing else, so the time the caller
+    agrees to is always the time that gets booked, and nobody else can take
+    it while it's being read back.
+    """
+
+    failure = _maybe_fail("hold_slot")
     if failure:
         return failure
     state = get_call_state()
     toggles = get_demo_toggles()
+    slot = state.calendar.get(slot_id)
+    if slot is None:
+        return False, {
+            "error": f"unknown slot_id {slot_id}",
+            "offered": _open_offered(state),
+            "instruction": "Retry with the slot_id of the option the caller chose. Don't mention this to the caller.",
+        }
+
+    if toggles.slot_conflict:
+        toggles.slot_conflict = False  # demo switch: another caller got there first
+        try_book(slot_id)
+    if not try_hold(slot_id, state.call_id):
+        state.offered_slot_ids = [sid for sid in state.offered_slot_ids if sid != slot_id]
+        state.log("conflict", f"{slot_id} was taken before it could be held")
+        return False, {
+            "error": "slot_taken",
+            "alternatives": _open_offered(state),
+            "instruction": (
+                "Apologise that the time was just taken. Offer an alternative (or check_availability "
+                "again if none), and hold the new choice before reading it back."
+            ),
+        }
+
+    state.held_slot_id = slot_id
+    when = slot.spoken(datetime.now().date())
+    state.log("held", f"{slot_id} ({when})")
+    if not state.intake.get("callback_confirmed"):
+        step = (
+            f"First confirm the callback number ({phone_readback(state.callback_number() or '')} or ask for one), "
+            f"then read back exactly '{when}' and ask whether to book it."
+        )
+    else:
+        step = f"Read back exactly '{when}' and ask whether to book it."
+    return True, {"held": True, "read_back": when, "instruction": step}
+
+
+def book_appointment(caller_confirmed: bool, slot_id: Optional[str] = None) -> ToolOutcome:
+    failure = _maybe_fail("book_appointment")
+    if failure:
+        return failure
+    state = get_call_state()
 
     if state.emergency:
         return False, {"error": "booking is blocked: this call was flagged as an emergency"}
@@ -479,46 +591,31 @@ def book_appointment(slot_id: str, caller_confirmed: bool) -> ToolOutcome:
             "error": "callback number not confirmed",
             "instruction": f"Read back {phone_readback(state.callback_number())} and get a yes, then record_intake(callback_confirmed=true).",
         }
-    if not caller_confirmed:
-        return False, {"error": "caller has not confirmed", "instruction": "Read back the day, time and provider and get an explicit yes first."}
-
-    slot = state.calendar.get(slot_id)
-    if slot is None:
-        today = datetime.now().date()
+    held = state.held_slot_id
+    if not held:
+        return False, {"error": "nothing held", "instruction": "Call hold_slot for the caller's choice and read it back first."}
+    if slot_id and slot_id != held:
+        when = state.calendar[held].spoken(datetime.now().date())
         return False, {
-            "error": f"unknown slot_id {slot_id}",
-            "offered": [
-                state.calendar[sid].as_option(today)
-                for sid in state.offered_slot_ids
-                if not state.calendar[sid].booked
-            ],
-            "instruction": "Retry with the slot_id of the option the caller chose. Don't mention this to the caller.",
-        }
-
-    if toggles.slot_conflict:
-        # Demo switch: simulate another caller taking it first.
-        toggles.slot_conflict = False
-        try_book(slot_id)
-        claimed = False
-    else:
-        # Atomic across concurrent calls: only one caller can claim a slot.
-        claimed = try_book(slot_id)
-    if not claimed:
-        state.offered_slot_ids = [sid for sid in state.offered_slot_ids if sid != slot_id]
-        state.log("conflict", f"{slot_id} was taken before booking")
-        alternatives = [
-            state.calendar[sid].as_option(datetime.now().date())
-            for sid in state.offered_slot_ids
-            if not state.calendar[sid].booked
-        ]
-        return False, {
-            "error": "slot_taken",
-            "alternatives": alternatives,
+            "error": "not the slot that was read back",
             "instruction": (
-                "Apologise that the time was just taken. Offer an alternative (or check_availability "
-                "again if none), and get a fresh confirmation before booking."
+                f"The time read back to the caller was '{when}'. Book that one, or if they chose a different "
+                "time, hold_slot it and read it back first."
             ),
         }
+    if not caller_confirmed:
+        return False, {"error": "caller has not confirmed", "instruction": "Read back the held time and get an explicit yes first."}
+
+    slot = state.calendar[held]
+    if not confirm_hold(held, state.call_id):
+        state.held_slot_id = None
+        state.log("conflict", f"hold on {held} expired and the slot was taken")
+        return False, {
+            "error": "slot_taken",
+            "alternatives": _open_offered(state),
+            "instruction": "Apologise that the time was just taken, offer another, and hold and read it back.",
+        }
+    state.held_slot_id = None
 
     confirmation = f"MS-{random.randint(1000, 9999)}"
     state.booking = {
@@ -548,6 +645,7 @@ def flag_emergency(description: str) -> ToolOutcome:
     """Model-side backstop for emergencies the keyword screen missed."""
 
     state = get_call_state()
+    _release_hold(state)
     state.emergency = {"flag": "model", "label": description, "category": "medical", "source": "model"}
     state.pending_check, state.pending_question = [], None
     state.log("emergency", f"model flagged: {description}")
@@ -562,6 +660,7 @@ _NURSE_REASONS = {"sensitive", "uncertain", "clinical_question", "no_availabilit
 
 
 def _create_handoff(state: CallState, reason: str, note: str, queue: Optional[str] = None) -> Dict[str, Any]:
+    _release_hold(state)
     queue = queue or ("nurse line" if reason in _NURSE_REASONS else "front desk")
     summary = {
         "queue": queue,
@@ -576,7 +675,7 @@ def _create_handoff(state: CallState, reason: str, note: str, queue: Optional[st
         "priority": state.priority,
         "safety": {
             "emergency": state.emergency,
-            "cleared_checks": [get_flag(key).label for key in state.cleared_flags],
+            "cleared_checks": [flag_label(key) for key in state.cleared_flags],
         },
         "booking": state.booking,
         "created_at": datetime.now().strftime("%H:%M:%S"),
@@ -621,6 +720,7 @@ TOOL_FUNCTIONS = {
     "record_intake": record_intake,
     "assign_priority": assign_priority,
     "check_availability": check_availability,
+    "hold_slot": hold_slot,
     "book_appointment": book_appointment,
     "flag_emergency": flag_emergency,
     "transfer_to_human": transfer_to_human,
@@ -638,7 +738,11 @@ def run_tool(name: str, arguments: Dict[str, Any]) -> ToolOutcome:
         failure = _maybe_fail(name)
         if failure:
             return failure
-    return TOOL_FUNCTIONS[name](**arguments)
+    function = TOOL_FUNCTIONS[name]
+    # Models occasionally add a parameter a tool doesn't take; drop it rather
+    # than fail the call over it.
+    accepted = inspect.signature(function).parameters
+    return function(**{key: value for key, value in arguments.items() if key in accepted})
 
 
 def allowed_tools() -> List[str]:

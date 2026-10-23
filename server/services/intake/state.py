@@ -50,6 +50,9 @@ class CallState:
     intake: Dict[str, Any] = field(default_factory=dict)
     priority: Optional[Dict[str, Any]] = None
     offered_slot_ids: List[str] = field(default_factory=list)
+    # The slot reserved for this caller while it's read back; booking can only
+    # confirm this one.
+    held_slot_id: Optional[str] = None
     booking: Optional[Dict[str, Any]] = None
     emergency: Optional[Dict[str, Any]] = None
     handoff: Optional[Dict[str, Any]] = None
@@ -57,6 +60,8 @@ class CallState:
     # so the caller's answer is judged against what they were actually asked.
     pending_check: List[str] = field(default_factory=list)
     pending_question: Optional[str] = None
+    pending_labels: Optional[str] = None
+    pending_category: str = "medical"
     pending_repeats: int = 0
     # Asked about and answered no: never re-asked, nudges priority up.
     cleared_flags: List[str] = field(default_factory=list)
@@ -112,8 +117,13 @@ class CallState:
             "offered_slots": [
                 self.calendar[slot_id].as_option(now.date())
                 for slot_id in self.offered_slot_ids
-                if slot_id in self.calendar and not self.calendar[slot_id].booked
+                if slot_id in self.calendar and self.calendar[slot_id].is_open_for(self.call_id)
             ],
+            "held_slot": (
+                self.calendar[self.held_slot_id].as_option(now.date())
+                if self.held_slot_id in self.calendar
+                else None
+            ),
             "booking": self.booking,
             "emergency": self.emergency,
             "handoff": self.handoff,

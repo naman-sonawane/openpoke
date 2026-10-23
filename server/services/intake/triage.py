@@ -19,7 +19,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 from ...config import get_settings
 from ...logging_config import logger
@@ -28,18 +28,27 @@ from .red_flags import RedFlag
 
 TRIAGE_TIMEOUT_SECONDS = 5.0
 
-_MENTION_PROMPT = """\
-You are the safety check on a doctor's office phone line. A keyword screen noticed words in the caller's latest message that can relate to an emergency warning sign: {labels}. Decide what the caller is actually saying about that warning sign, using the conversation for context. You never give medical advice.
+# One screening prompt for every caller turn. It works from categories and
+# meaning, not phrasings, so wording the keyword patterns have never seen
+# ("my newborn is burning up") is still caught.
+_SCREEN_PROMPT = """\
+You are the safety check on a doctor's office phone line. Read the caller's latest words in the context of the conversation and decide whether they describe a possible emergency happening now. You never give medical advice.{hint}
+
+Warning signs (judge by meaning, not exact words; this list is not exhaustive):
+- chest pain or pressure; trouble breathing or turning blue; stroke signs (face drooping, arm or leg weakness, slurred speech, sudden confusion, sudden vision loss); fainting, unresponsiveness or seizure; heavy bleeding that won't stop; severe allergic reaction (throat, tongue or lip swelling); possible overdose or poisoning; a sudden, worst-ever headache.
+- High-risk groups, where ordinary-sounding symptoms are urgent: any fever in a baby under three months old; in pregnancy, a severe headache, vision changes, bleeding, leaking fluid, much less movement from the baby, or severe belly pain; a young child who is very hard to wake, floppy, or not drinking; an older adult with sudden confusion, or a fall with a head injury.
+- Thoughts of suicide or of harming themselves (category "crisis").
 
 Reply with JSON only, no other text:
-{{"verdict": "emergency" | "denied" | "ask", "question": "<only for ask>", "reason": "<a few words>"}}
+{{"verdict": "emergency" | "ask" | "denied" | "none", "category": "medical" | "crisis", "question": "<only for ask>", "reason": "<a few words>"}}
 
-- "emergency": the caller (or someone with them) has this warning sign now or it started recently and hasn't gone away, described in a way that could be serious. Examples: "I've had crushing chest pain for half an hour", "got stung and my throat feels tight". Any recent possible overdose or poisoning is an emergency; don't ask for amounts. Any fever in a baby under three months old is an emergency.
-- "denied": the caller says they don't have it, in any ordinary phrasing ("no chest pain, just a cough", "I don't think I have any chest pain", "my chest doesn't hurt, it's my back"), or the words aren't about a current symptom at all: a past episode that has resolved, a relative's history, medication or appointment names, a figure of speech ("this bill is giving me a heart attack"). Asking someone about a symptom they just said they don't have sounds robotic; don't.
-- "ask": they describe something that may be present now but it's unclear how serious it is: "my chest feels kind of tight sometimes", "a bit short of breath", "my heart's been racing". Or they ask about the symptom in a way that suggests they might have it.
-- If it may be happening now and could be serious, choose emergency over ask. If they plainly deny it, choose denied over ask.
+- "emergency": a warning sign, or a high-risk situation above, is happening now or started recently and hasn't gone away. Examples: "I've had crushing chest pain for half an hour", "got stung and my throat feels tight", "my 6-week-old has a fever". Any recent possible overdose or poisoning is an emergency; don't ask for amounts.
+- "ask": something on the list may be happening now but it's genuinely unclear whether it is or how serious it is: "my chest feels kind of tight sometimes", "a bit short of breath", "my heart's been racing". Or they ask about a warning sign in a way that suggests they might have it.
+- "denied": the caller mentions a warning sign but says they don't have it, in any ordinary phrasing ("no chest pain, just a cough", "I don't think I have any chest pain"), or it isn't a current symptom: a resolved past episode, a relative's history, a medication or appointment name, a figure of speech ("this bill is giving me a heart attack"). Asking about something they just ruled out sounds robotic; don't.
+- "none": nothing on the list comes up. Ordinary reasons to call (sore throat, cough, refill, back pain, rash, check-up, billing, names, dates, scheduling) are "none". Most turns are "none".
+- If it may be happening now and could be serious, choose emergency over ask. If they plainly deny it, choose denied over ask. Don't choose ask for ordinary complaints.
 
-For "ask", write one short, warm, natural yes/no question that fits the conversation and settles whether they have it right now. Exactly one question: no follow-ups, no asking for amounts or details, no lists of symptoms. Don't repeat their words back word for word, don't explain why you're asking, don't reassure or assess. Example: "Just so I'm sure, are you feeling any tightness or pressure in your chest right now?"
+For "ask", write one short, warm, natural yes/no question that fits the conversation and settles whether it's happening right now. Exactly one question: no follow-ups, no asking for amounts or details, no lists of symptoms. Don't repeat their words back word for word, don't explain why you're asking, don't reassure or assess. Example: "Just so I'm sure, are you feeling any tightness or pressure in your chest right now?"
 """
 
 _ANSWER_PROMPT = """\
@@ -48,8 +57,8 @@ You are the safety check on a doctor's office phone line. The caller was just as
 Classify their answer. Reply with JSON only:
 {{"verdict": "emergency" | "denied" | "repeat" | "unclear", "reason": "<a few words>"}}
 
-- "emergency": yes, or any degree of yes or doubt: "a little", "kind of", "maybe", "I don't know", "not sure", "I guess", "it comes and goes", or describing the symptom as present now. On a safety question, uncertainty counts as yes.
-- "denied": any ordinary no: "no", "nope", "nah I'm good", "not right now", "I'm fine", "no, it's just the cough".
+- "emergency": it is happening now: yes, or any degree of yes or doubt about right now: "a little", "kind of", "maybe", "I don't know", "not sure", "I guess", or describing the symptom as present at this moment. On a safety question, uncertainty about right now counts as yes.
+- "denied": they say it is not happening right now, in any ordinary phrasing: "no", "nope", "nah I'm good", "I'm fine", "no, it's just the cough". This includes "not right now, it comes and goes": an intermittent symptom they say isn't happening at this moment is not an emergency (staff review it through the priority). But "it kind of comes and goes" alone, without saying it isn't happening now, is uncertain about right now: that's emergency.
 - "repeat": they didn't hear or understand the question ("sorry, what?", "huh?").
 - "unclear": they talked about something else and didn't answer at all.
 """
@@ -57,14 +66,11 @@ Classify their answer. Reply with JSON only:
 
 @dataclass
 class TriageResult:
-    verdict: str  # emergency | denied | ask | repeat | unclear
+    verdict: str  # emergency | ask | denied | none | repeat | unclear
     question: Optional[str] = None
     reason: str = ""
-    source: str = "model"  # "model" | "fallback"
-
-
-def _labels(flags: Sequence[RedFlag]) -> str:
-    return ", ".join(flag.label for flag in flags)
+    source: str = "model"  # "model" | "fallback" | "override"
+    category: str = "medical"  # "medical" | "crisis"
 
 
 def _parse(content: str, allowed: Sequence[str]) -> Optional[dict]:
@@ -118,24 +124,49 @@ async def _call(system: str, context: str, caller_text: str) -> str:
     return (choice.get("message") or {}).get("content") or ""
 
 
-async def judge_mention(flags: List[RedFlag], caller_text: str, context: str) -> TriageResult:
-    """Decide what a possible red-flag mention means. Never raises."""
+async def screen_turn(caller_text: str, context: str, hints: Sequence[RedFlag] = ()) -> TriageResult:
+    """Screen one caller turn for a possible emergency. Never raises.
 
+    hints are keyword matches, passed so the model knows what tripped the
+    screen; with no hints this is the always-on check of an ordinary turn.
+
+    On failure: with hints, fall back to asking the canned question (a
+    keyword already matched, so stay conservative); without hints, return
+    "none", since nothing matched and the conversation should not stall on a
+    provider outage.
+    """
+
+    hint = ""
+    if hints:
+        hint = (
+            "\nA keyword screen noticed words that can relate to: "
+            + ", ".join(flag.label for flag in hints)
+            + ". Decide what the caller actually means by them."
+        )
     try:
-        content = await _call(_MENTION_PROMPT.format(labels=_labels(flags)), context, caller_text)
-        data = _parse(content, ("emergency", "denied", "ask"))
+        content = await _call(_SCREEN_PROMPT.format(hint=hint), context, caller_text)
+        data = _parse(content, ("emergency", "ask", "denied", "none"))
     except Exception as exc:  # timeout, network, provider error
-        logger.warning("triage mention call failed", extra={"error": str(exc)})
+        logger.warning("triage screen call failed", extra={"error": str(exc)})
         data = None
 
     if data is None:
-        return TriageResult("ask", flags[0].question, "triage unavailable", source="fallback")
-    if data["verdict"] == "ask" and not _usable_question(data.get("question")):
-        return TriageResult("ask", flags[0].question, data.get("reason", ""), source="fallback")
-    return TriageResult(data["verdict"], (data.get("question") or "").strip() or None, data.get("reason", ""))
+        if hints:
+            return TriageResult("ask", hints[0].question, "triage unavailable", "fallback", hints[0].category)
+        return TriageResult("none", reason="triage unavailable", source="fallback")
+    category = "crisis" if data.get("category") == "crisis" else "medical"
+    question = (data.get("question") or "").strip() or None
+    if data["verdict"] == "ask" and not _usable_question(question):
+        if not hints:
+            # A usable question is the whole point of "ask"; without one and
+            # without a keyword to fall back on, hand the turn on as normal
+            # rather than ask something malformed.
+            return TriageResult("none", reason="no usable question", source="fallback")
+        return TriageResult("ask", hints[0].question, data.get("reason", ""), "fallback", hints[0].category)
+    return TriageResult(data["verdict"], question, data.get("reason", ""), category=category)
 
 
-async def judge_answer(flags: List[RedFlag], question: str, caller_text: str, context: str) -> TriageResult:
+async def judge_answer(labels: str, question: str, caller_text: str, context: str) -> TriageResult:
     """Classify the caller's answer to a safety question. Never raises.
 
     Falls back to the keyword yes/no classifier, which treats doubt as yes.
@@ -145,7 +176,7 @@ async def judge_answer(flags: List[RedFlag], question: str, caller_text: str, co
 
     try:
         content = await _call(
-            _ANSWER_PROMPT.format(labels=_labels(flags), question=question), context, caller_text
+            _ANSWER_PROMPT.format(labels=labels, question=question), context, caller_text
         )
         data = _parse(content, ("emergency", "denied", "repeat", "unclear"))
     except Exception as exc:

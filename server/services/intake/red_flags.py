@@ -1,4 +1,8 @@
-"""Keyword screen that runs on every caller turn before the conversation model.
+"""Keyword screen: the instant first layer of the safety check.
+
+These patterns are a fast path and a hint, not the safety net. Every caller
+turn is also screened by a model (triage.py) that works from categories and
+meaning, so an emergency in wording no pattern anticipates is still caught.
 
 Two pattern sets per red flag:
 
@@ -8,9 +12,9 @@ Two pattern sets per red flag:
   and impossible to talk the system out of.
 * possible - anything that might be an emergency depending on context:
   hedged or ambiguous symptoms ("chest feels tight"), referential nouns
-  ("my stroke follow-up"), negations ("no chest pain"). These go to the
-  triage model (triage.py), which reads the conversation and decides whether
-  it's an emergency, a denial, or worth one natural follow-up question.
+  ("my stroke follow-up"), negations ("no chest pain"). These are passed to
+  the triage model as hints, and screened before the conversation model runs
+  so a denial can be noted in its prompt.
 
 A definite match that is negated or has a context marker in its clause (past
 tense, a relative, medication, a worry) is downgraded to possible, so it is
@@ -198,18 +202,6 @@ RED_FLAGS: Tuple[RedFlag, ...] = (
         question="Has someone taken too much of a medication or swallowed something harmful?",
     ),
     RedFlag(
-        key="infant_fever",
-        label="a fever in a young baby",
-        category="medical",
-        definite=(),
-        possible=(
-            r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|few)[- ](day|week)s?[- ]old\b.*\b(fever|temperature|hot)\b",
-            r"\b(fever|temperature)\b.*\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|few)[- ](day|week)s?[- ]old\b",
-            r"\bnewborn\b.*\b(fever|temperature)\b",
-        ),
-        question="Is the baby younger than three months old?",
-    ),
-    RedFlag(
         key="headache",
         label="a sudden severe headache",
         category="medical",
@@ -262,6 +254,24 @@ class ScreenHit:
 
 def get_flag(key: str) -> Optional[RedFlag]:
     return _FLAGS_BY_KEY.get(key)
+
+
+#: Prefix for warning signs the model screen found with no matching pattern.
+#: The label rides in the key ("model:fever in a newborn") so every place that
+#: shows a flag can name it without a pattern entry.
+MODEL_FLAG_PREFIX = "model:"
+
+
+def model_flag_key(label: str) -> str:
+    return MODEL_FLAG_PREFIX + label
+
+
+def flag_label(key: str) -> str:
+    """Human-readable name for a pattern flag or a model-found one."""
+    flag = _FLAGS_BY_KEY.get(key)
+    if flag:
+        return flag.label
+    return key[len(MODEL_FLAG_PREFIX):] if key.startswith(MODEL_FLAG_PREFIX) else key
 
 
 def _normalize(text: str) -> str:

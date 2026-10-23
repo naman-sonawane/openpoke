@@ -27,10 +27,22 @@ def intake_server(sandbox, monkeypatch):
     voice = importlib.import_module("server.routes.voice")
     state = importlib.import_module("server.services.intake.state")
 
-    async def fake_llm(*, messages, **kwargs):
+    async def fake_llm(*, messages, system="", **kwargs):
         await asyncio.sleep(FAKE_LATENCY)
-        latest = re.search(r"<new_user_message>\n(.*?)\n</new_user_message>", messages[0]["content"], re.S)
-        return {"choices": [{"message": {"content": f"Heard: {latest.group(1) if latest else ''}", "tool_calls": []}}]}
+        content = messages[0]["content"]
+        if "safety check" in system:
+            # Fake triage: only a newborn with a fever is an emergency.
+            urgent = "newborn" in content and "hot" in content
+            verdict = '{"verdict": "emergency", "category": "medical", "reason": "newborn fever"}'
+            return {"choices": [{"message": {"content": verdict if urgent else '{"verdict": "none"}'}}]}
+        latest = re.search(r"<new_user_message>\n(.*?)\n</new_user_message>", content, re.S)
+        said = latest.group(1) if latest else ""
+        if "newborn" in said and len(messages) == 1:
+            # The conversation model tries to act on the flagged turn.
+            call = {"id": "c1", "type": "function",
+                    "function": {"name": "register_new_patient", "arguments": '{"name": "Test", "date_of_birth": "2026-09-01"}'}}
+            return {"choices": [{"message": {"content": "", "tool_calls": [call]}}]}
+        return {"choices": [{"message": {"content": f"Heard: {said}", "tool_calls": []}}]}
 
     monkeypatch.setattr(runtime, "request_chat_completion", fake_llm)
     monkeypatch.setattr(triage, "request_chat_completion", fake_llm)
@@ -85,6 +97,25 @@ async def test_turns_within_one_call_stay_in_order(intake_server):
     roles = [m["role"] for m in transcript]
     # greeting, then strictly alternating caller/agent: no two runs interleaved
     assert roles == ["assistant"] + ["user", "assistant"] * 5
+
+
+async def test_always_on_screen_preempts_the_model_before_any_tool_runs(intake_server):
+    voice, _ = intake_server
+    # No keyword pattern matches this; only the model screen can catch it. The
+    # conversation model meanwhile tries to register the patient.
+    call_id, turn = await _call(voice, "please book my newborn, she feels really hot")
+    assert "911" in turn["reply"]
+    state = _body(voice.intake_state(call_id=call_id))
+    assert state["stage"] == "emergency"
+    assert state["caller"] is None, "a tool ran on a turn the safety screen flagged"
+
+
+async def test_always_on_screen_adds_no_latency_when_quiet(intake_server):
+    voice, _ = intake_server
+    _, turn = await _call(voice, "I'd like a check-up")
+    # Screen and model each take 200ms and run side by side, not one after the other.
+    assert turn["timings"]["screen_wait_ms"] < 100
+    assert turn["latency_ms"] < 2 * FAKE_LATENCY * 1000
 
 
 async def test_unknown_call_id_is_rejected(intake_server):
