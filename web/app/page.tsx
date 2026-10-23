@@ -152,6 +152,8 @@ export default function Page() {
   // so it pauses while the agent talks. Interrupting is explicit instead:
   // Space, or a tap on the status bar.
   const voice = useVoiceCall({ onTurn: sendTurn, bargeIn: false });
+  // A handoff hands the caller to a person: the assistant's side is closed.
+  const transferred = intakeState?.stage === 'handoff';
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -169,6 +171,9 @@ export default function Page() {
     window.speechSynthesis?.cancel();
     setError(null);
     setLastLatencyMs(null);
+    // Turn voice on with the click itself (browsers only allow mic and speech
+    // from a user action), so New call alone is enough to hear the greeting.
+    if (voice.supported && !voice.active) voice.start();
     try {
       // A new call gets a new id: nothing to clear, and other calls (other
       // tabs, other devices) are untouched.
@@ -180,7 +185,7 @@ export default function Page() {
       setMessages([]);
       setIntakeState(null);
       await refresh();
-      if (voice.active && data?.reply) void voice.speak(data.reply);
+      if (voice.supported && data?.reply) void voice.speak(data.reply);
     } catch (err: any) {
       setError(err?.message || 'Failed to start a new call');
     }
@@ -273,10 +278,17 @@ export default function Page() {
 
             <div className="border-t border-gray-200 p-3">
               {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+              {transferred && (
+                <p className="mb-2 text-center text-sm text-gray-500">
+                  Transferred to the {intakeState?.handoff?.queue}. Press New call to start another.
+                </p>
+              )}
               <ChatInput
                 value={input}
-                canSubmit={input.trim().length > 0 && !isWaitingForResponse}
-                placeholder={voice.active ? 'Speak, or type as the caller…' : 'Type as the caller…'}
+                canSubmit={input.trim().length > 0 && !isWaitingForResponse && !transferred}
+                placeholder={
+                  transferred ? 'Call transferred' : voice.active ? 'Speak, or type as the caller…' : 'Type as the caller…'
+                }
                 onChange={setInput}
                 onSubmit={handleSubmit}
               />

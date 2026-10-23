@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import random
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -125,6 +126,33 @@ def _labels(flags: List[RedFlag]) -> str:
     return ", ".join(flag.label for flag in flags)
 
 
+# Words that appear in any "is it happening right now?" question and say
+# nothing about which symptom it is about.
+_QUESTION_FILLER = {
+    "are", "you", "your", "feeling", "having", "that", "this", "the", "any", "right", "now", "just",
+    "sure", "moment", "very", "still", "with", "does", "did", "is", "it", "or", "and", "at", "a", "an",
+    "in", "of", "on", "to", "be", "so", "do", "happening", "currently", "today", "only", "when",
+    "come", "comes", "go", "goes", "get", "gets", "bit", "ago", "kind",
+}
+
+
+def _symptom_words(question: str) -> set:
+    return {
+        word
+        for word in re.findall(r"[a-z]+", question.lower())
+        if len(word) > 3 and word not in _QUESTION_FILLER
+    }
+
+
+def _repeats_answered_question(state: CallState, question: Optional[str]) -> bool:
+    """True when a new safety question is about a symptom the caller already
+    said no to. The model screen re-asks when given new details about the same
+    symptom even when told not to, so this is enforced in code."""
+
+    new = _symptom_words(question or "")
+    return bool(new) and any(new & _symptom_words(previous) for previous in state.answered_no)
+
+
 def _act_on_screen(
     state: CallState, result: "triage.TriageResult", keys: List[str], label: str, caller_text: str
 ) -> Optional[str]:
@@ -133,6 +161,9 @@ def _act_on_screen(
 
     if result.verdict == "emergency":
         return _declare_emergency(state, keys[0], label, result.category, "triage", caller_text)
+    if result.verdict == "ask" and _repeats_answered_question(state, result.question):
+        state.log("safety_check", f"repeat question suppressed: \"{result.question}\"")
+        return None
     if result.verdict == "ask":
         state.pending_check = keys
         state.pending_question = result.question
@@ -198,6 +229,8 @@ async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
             return GateDecision(reply=UNCLEAR_CHECK_SCRIPT)
         just_cleared = list(state.pending_check)
         state.cleared_flags.extend(key for key in just_cleared if key not in state.cleared_flags)
+        if state.pending_question:
+            state.answered_no.append(state.pending_question)
         state.pending_check, state.pending_question = [], None
         notes.append(
             f"The caller just answered no to the safety question about {labels}. "
@@ -216,7 +249,7 @@ async def pre_screen(caller_text: str, context: str = "") -> GateDecision:
     ]
     if possible:
         flags = [hit.flag for hit in possible]
-        result = await triage.screen_turn(caller_text, context, hints=flags)
+        result = await triage.screen_turn(caller_text, context, hints=flags, already_asked=state.answered_no)
         matched = ", ".join(f"\"{hit.matched}\"" for hit in possible)
         state.log("safety_check", f"{matched} -> {result.verdict} ({result.source}: {result.reason})")
         reply = _act_on_screen(state, result, [flag.key for flag in flags], _labels(flags), caller_text)
@@ -246,7 +279,7 @@ async def background_screen(caller_text: str, context: str = "") -> GateDecision
     state = get_call_state()
     if state.stage in ("emergency", "handoff"):
         return GateDecision()
-    result = await triage.screen_turn(caller_text, context)
+    result = await triage.screen_turn(caller_text, context, already_asked=state.answered_no)
     if result.verdict == "none":
         return GateDecision()
     label = result.reason or "a possible warning sign"

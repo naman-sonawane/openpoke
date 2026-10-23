@@ -124,7 +124,9 @@ async def _call(system: str, context: str, caller_text: str) -> str:
     return (choice.get("message") or {}).get("content") or ""
 
 
-async def screen_turn(caller_text: str, context: str, hints: Sequence[RedFlag] = ()) -> TriageResult:
+async def screen_turn(
+    caller_text: str, context: str, hints: Sequence[RedFlag] = (), already_asked: Sequence[str] = ()
+) -> TriageResult:
     """Screen one caller turn for a possible emergency. Never raises.
 
     hints are keyword matches, passed so the model knows what tripped the
@@ -142,6 +144,17 @@ async def screen_turn(caller_text: str, context: str, hints: Sequence[RedFlag] =
             "\nA keyword screen noticed words that can relate to: "
             + ", ".join(flag.label for flag in hints)
             + ". Decide what the caller actually means by them."
+        )
+    if already_asked:
+        # Without this the screen re-asks "is it happening right now?" each
+        # time the caller adds a detail, which is exactly the robotic
+        # repetition a caller notices.
+        hint += (
+            "\nSafety questions already asked on this call, which the caller answered no to: "
+            + " | ".join(f'"{question}"' for question in already_asked)
+            + ". Never ask these again or reword them. New details about the same symptom "
+            "(when it started, that it's getting worse, how bad it is) are not a reason to re-ask: "
+            "choose emergency only if the caller now says it is happening right now, otherwise none."
         )
     try:
         content = await _call(_SCREEN_PROMPT.format(hint=hint), context, caller_text)

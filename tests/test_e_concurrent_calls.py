@@ -30,7 +30,7 @@ def intake_server(sandbox, monkeypatch):
     async def fake_llm(*, messages, system="", **kwargs):
         await asyncio.sleep(FAKE_LATENCY)
         content = messages[0]["content"]
-        if "safety check" in system:
+        if (system or "").startswith("You are the safety check"):
             # Fake triage: only a newborn with a fever is an emergency.
             urgent = "newborn" in content and "hot" in content
             verdict = '{"verdict": "emergency", "category": "medical", "reason": "newborn fever"}'

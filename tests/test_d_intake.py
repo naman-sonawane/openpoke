@@ -101,8 +101,9 @@ def fake_triage(intake):
     script = {"mention": [], "answer": []}
     originals = (triage.screen_turn, triage.judge_answer)
 
-    async def screen_turn(caller_text, context, hints=()):
+    async def screen_turn(caller_text, context, hints=(), already_asked=()):
         calls["mention"].append(caller_text)
+        calls.setdefault("already_asked", []).append(list(already_asked))
         return script["mention"].pop(0)
 
     async def judge_answer(labels, question, caller_text, context):
@@ -169,6 +170,40 @@ def test_unknown_tool_arguments_are_ignored(intake):
     service.assign_priority(reason_for_visit="physical", visit_type="wellness")
     ok, payload = service.run_tool("check_availability", {"time_of_day": "morning", "priority": "routine"})
     assert ok and payload["options"]
+
+
+async def test_a_question_answered_no_is_passed_to_later_screens(intake, fake_triage):
+    # Regression: "is it happening right now?" was asked, answered no, then
+    # asked again when the caller added that it was getting worse.
+    triage, script, calls = fake_triage
+    question = "Are you feeling that tightness in your chest right now?"
+    script["mention"] += [triage.TriageResult("ask", question=question, reason="chest tightness"),
+                          triage.TriageResult("none")]
+    script["answer"].append(triage.TriageResult("denied"))
+    service = intake["service"]
+    await service.background_screen("my chest feels kind of tight sometimes")
+    await service.pre_screen("no")
+    await service.background_screen("yeah it's getting worse")
+    assert calls["already_asked"][-1] == [question]
+
+
+async def test_a_reworded_repeat_question_is_suppressed_but_a_new_symptom_is_not(intake, fake_triage):
+    triage, script, _ = fake_triage
+    script["mention"] += [
+        triage.TriageResult("ask", question="Are you feeling that tightness in your chest right now?"),
+        # The model screen re-asks the same thing in new words:
+        triage.TriageResult("ask", question="Are you having that chest tightness right now, or does it come and go?"),
+        # ...but a different symptom must still be asked about:
+        triage.TriageResult("ask", question="Is one side of your face drooping right now?"),
+    ]
+    script["answer"].append(triage.TriageResult("denied"))
+    service = intake["service"]
+    await service.background_screen("my chest feels kind of tight sometimes")
+    await service.pre_screen("no")
+    repeat = await service.background_screen("yeah it's getting worse")
+    assert repeat.reply is None
+    new_symptom = await service.background_screen("and my face feels weird")
+    assert new_symptom.reply == "Is one side of your face drooping right now?"
 
 
 async def test_yes_to_safety_question_is_an_emergency(intake, fake_triage):

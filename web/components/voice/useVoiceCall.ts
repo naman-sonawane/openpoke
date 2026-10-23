@@ -87,8 +87,10 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
     window.speechSynthesis.onvoiceschanged = pickVoice;
   }, []);
 
-  // Speaker mode: abort recognition while the agent talks (anything heard then
-  // is the agent itself) and restart it shortly after it stops.
+  // Speaker mode: drop the recognizer while the agent talks (anything heard
+  // then is the agent itself) and start a fresh one shortly after it stops.
+  // Restarting the same recognizer right after aborting it is racy on desktop
+  // Chrome and can leave it dead without an error, so it is never reused.
   const pauseMic = () => {
     if (resumeTimerRef.current) {
       window.clearTimeout(resumeTimerRef.current);
@@ -96,10 +98,16 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
     }
     if (micPausedRef.current) return;
     micPausedRef.current = true;
-    try {
-      recognitionRef.current?.abort();
-    } catch {
-      /* not running */
+    const recognizer = recognitionRef.current;
+    recognitionRef.current = null;
+    if (recognizer) {
+      recognizer.onend = null; // a late onend must not restart it
+      recognizer.onresult = null;
+      try {
+        recognizer.abort();
+      } catch {
+        /* not running */
+      }
     }
   };
 
@@ -109,14 +117,10 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
       resumeTimerRef.current = null;
       if (window.speechSynthesis.speaking) return; // the next utterance resumes it
       micPausedRef.current = false;
-      if (!activeRef.current) return;
-      try {
-        recognitionRef.current?.start();
-      } catch {
-        /* already started */
-      }
+      if (activeRef.current) startRecognitionRef.current();
     }, SPEAKER_TAIL_MS);
   };
+  const startRecognitionRef = useRef<() => void>(() => {});
 
   const idleStatus = useCallback((): VoiceStatus => {
     if (!activeRef.current) return 'off';
@@ -235,7 +239,7 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
     // Chrome ends recognition after a stretch of silence; keep it alive
     // (unless speaker mode switched it off on purpose).
     recognition.onend = () => {
-      if (!activeRef.current || micPausedRef.current) return;
+      if (!activeRef.current || micPausedRef.current || recognitionRef.current !== recognition) return;
       try {
         recognition.start();
       } catch {
@@ -251,17 +255,25 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
       }
     };
 
-    recognition.start();
     recognitionRef.current = recognition;
+    try {
+      recognition.start();
+    } catch (err) {
+      console.warn('speech recognition failed to start', err);
+    }
   }, [isEcho]);
+  startRecognitionRef.current = startRecognition;
 
   const start = useCallback(() => {
     if (!supported || activeRef.current) return;
     // Mobile browsers only allow speech that starts from a tap. Speak a silent
-    // utterance inside this click so later replies are allowed to play.
-    const unlock = new SpeechSynthesisUtterance(' ');
-    unlock.volume = 0;
-    window.speechSynthesis.speak(unlock);
+    // utterance inside this click so later replies are allowed to play. Phones
+    // only: on desktop Chrome a blank utterance can stall the speech queue.
+    if (/Android|iPhone|iPad/i.test(navigator.userAgent)) {
+      const unlock = new SpeechSynthesisUtterance(' ');
+      unlock.volume = 0;
+      window.speechSynthesis.speak(unlock);
+    }
     activeRef.current = true;
     setActive(true);
     setStatus('listening');
@@ -277,8 +289,10 @@ export function useVoiceCall({ onTurn, bargeIn }: UseVoiceCallOptions) {
     micPausedRef.current = false;
     if (endTimerRef.current) window.clearTimeout(endTimerRef.current);
     if (resumeTimerRef.current) window.clearTimeout(resumeTimerRef.current);
+    const recognizer = recognitionRef.current;
+    recognitionRef.current = null;
     try {
-      recognitionRef.current?.stop();
+      recognizer?.stop();
     } catch {
       /* not running */
     }

@@ -65,6 +65,8 @@ class CallState:
     pending_repeats: int = 0
     # Asked about and answered no: never re-asked, nudges priority up.
     cleared_flags: List[str] = field(default_factory=list)
+    # The exact safety questions answered no, so the screen never re-asks them.
+    answered_no: List[str] = field(default_factory=list)
     # Caller ruled it out unprompted ("no chest pain"): never asked about.
     denied_flags: List[str] = field(default_factory=list)
     tool_failures: int = 0
